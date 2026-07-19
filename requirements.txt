@@ -3,8 +3,20 @@ duckdb==1.0.0
 pandas==2.2.2
 numpy==1.26.4
 
-# Data collection (not yet wired in - see ingestion/ stubs)
-yfinance==0.2.40
+# Data collection - see PROJECT_STATUS.md "yfinance version compatibility
+# audit" entry (2026-07-19, final). Confirmed sequence: 0.2.40 (the
+# original pin) FAILED against both D05.SI and AAPL with
+# JSONDecodeError/YFTzMissingError, returning zero rows. 1.5.1 was then
+# installed, and the first successful live ingestion of D05.SI (6,720
+# rows) and ^STI (9,137 rows) occurred under 1.5.1. Pinned here to match
+# that demonstrated-working version - not because it is newer, but
+# because it is the specific version with reproducible evidence of
+# working end to end in this project. A prior edit to this file
+# incorrectly reverted this pin to 0.2.40 based on an unconfirmed claim
+# that 0.2.40 had worked; that claim was itself wrong and has been
+# corrected. Do not change this pin without a demonstrated technical
+# reason - see PROJECT_STATUS.md for the full audit trail.
+yfinance==1.5.1
 
 # Modeling (not yet used - added now so the pinned stack is decided upfront)
 scikit-learn==1.5.1
