@@ -109,9 +109,25 @@ def validate_price_rows(df: pd.DataFrame, ticker: str, entity_type: str, listed_
 def check_cross_instrument_date_consistency(con) -> dict:
     """
     Compares trade dates present in prices_daily (D05.SI) against
-    index_daily (^STI). Any date present in one but not the other is
-    returned as an anomaly candidate for manual review - NOT an
-    automatic "missing data" classification (see module docstring).
+    index_daily (^STI), RESTRICTED TO THE OVERLAPPING DATE RANGE of the
+    two instruments. Any date present in one but not the other, within
+    that overlap, is returned as an anomaly candidate for manual review -
+    NOT an automatic "missing data" classification (see module
+    docstring).
+
+    OVERLAP RESTRICTION (added after the first real-data run, see
+    PROJECT_STATUS.md): ^STI's history starts in 1990, D05.SI's starts
+    in 2000 (it wasn't listed yet). Comparing full history therefore
+    flagged every pre-2000 ^STI date as a false "D05.SI missing"
+    anomaly, and also surfaced likely SG public holidays as anomalies -
+    this check was never intended as a holiday-calendar detector (see
+    module docstring) and no such calendar is introduced here. The fix
+    is to only compare dates within
+    [max(first date of either instrument), min(last date of either
+    instrument)] - the period where both instruments could plausibly
+    have traded. Dates outside this window are not evaluated at all,
+    not silently reclassified as "not anomalies" - they were never a
+    fair comparison to begin with.
 
     HARDENING (Phase 2 patch): if either table has zero rows, the
     comparison is skipped entirely rather than run - comparing a
@@ -120,7 +136,9 @@ def check_cross_instrument_date_consistency(con) -> dict:
     finding. This is a defensive check at the function level regardless
     of what the caller already knows about this run's success/failure.
 
-    Returns a dict: {"skipped": bool, "reason": str or None, "anomalies": list}
+    Returns a dict: {"skipped": bool, "reason": str or None,
+    "overlap_start": date or None, "overlap_end": date or None,
+    "anomalies": list}
     """
     security_count = con.execute("SELECT COUNT(*) FROM prices_daily").fetchone()[0]
     index_count = con.execute("SELECT COUNT(*) FROM index_daily").fetchone()[0]
@@ -133,6 +151,25 @@ def check_cross_instrument_date_consistency(con) -> dict:
                 "consistency check requires both to be non-empty, skipped to avoid a flood of "
                 "false anomalies from one-sided data."
             ),
+            "overlap_start": None,
+            "overlap_end": None,
+            "anomalies": [],
+        }
+
+    security_range = con.execute("SELECT MIN(trade_date), MAX(trade_date) FROM prices_daily").fetchone()
+    index_range = con.execute("SELECT MIN(trade_date), MAX(trade_date) FROM index_daily").fetchone()
+    overlap_start = max(security_range[0], index_range[0])
+    overlap_end = min(security_range[1], index_range[1])
+
+    if overlap_start > overlap_end:
+        return {
+            "skipped": True,
+            "reason": (
+                f"D05.SI range ({security_range[0]} to {security_range[1]}) and ^STI range "
+                f"({index_range[0]} to {index_range[1]}) do not overlap - consistency check skipped."
+            ),
+            "overlap_start": None,
+            "overlap_end": None,
             "anomalies": [],
         }
 
@@ -140,18 +177,20 @@ def check_cross_instrument_date_consistency(con) -> dict:
         """
         SELECT p.trade_date FROM prices_daily p
         LEFT JOIN index_daily i ON p.trade_date = i.trade_date
-        WHERE i.trade_date IS NULL
+        WHERE i.trade_date IS NULL AND p.trade_date BETWEEN ? AND ?
         ORDER BY p.trade_date
-        """
+        """,
+        [overlap_start, overlap_end],
     ).fetchall()
 
     index_only = con.execute(
         """
         SELECT i.trade_date FROM index_daily i
         LEFT JOIN prices_daily p ON i.trade_date = p.trade_date
-        WHERE p.trade_date IS NULL
+        WHERE p.trade_date IS NULL AND i.trade_date BETWEEN ? AND ?
         ORDER BY i.trade_date
-        """
+        """,
+        [overlap_start, overlap_end],
     ).fetchall()
 
     anomalies = []
@@ -167,7 +206,7 @@ def check_cross_instrument_date_consistency(con) -> dict:
             "trade_date": d,
             "detail": "^STI has an observation on this date; D05.SI does not - review, not confirmed missing data",
         })
-    return {"skipped": False, "reason": None, "anomalies": anomalies}
+    return {"skipped": False, "reason": None, "overlap_start": overlap_start, "overlap_end": overlap_end, "anomalies": anomalies}
 
 
 def generate_data_quality_report(con) -> str:

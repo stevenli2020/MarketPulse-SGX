@@ -84,11 +84,14 @@ def main():
         check_result = check_cross_instrument_date_consistency(con)
         if check_result["skipped"]:
             print(f"  SKIPPED: {check_result['reason']}")
-        elif check_result["anomalies"]:
-            for a in check_result["anomalies"]:
-                print(f"  WARNING: {a['detail']} ({a['trade_date']})")
         else:
-            print("  none found")
+            print(f"  Comparing overlap window {check_result['overlap_start']} to {check_result['overlap_end']} only "
+                  f"(dates outside this window are not evaluated - see PROJECT_STATUS.md)")
+            if check_result["anomalies"]:
+                for a in check_result["anomalies"]:
+                    print(f"  WARNING: {a['detail']} ({a['trade_date']})")
+            else:
+                print("  none found")
 
     print("\n" + generate_data_quality_report(con))
 

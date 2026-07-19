@@ -152,7 +152,7 @@ def test_revision_is_detected_and_reported(con):
     assert "close" in revisions[0]["changed_fields"]
 
 
-# --- Cross-instrument check skip --------------------------------------------
+# --- Cross-instrument check: overlap window ---------------------------------
 
 def test_cross_instrument_check_skipped_when_one_side_empty(con):
     con.execute("BEGIN TRANSACTION")
@@ -167,17 +167,47 @@ def test_cross_instrument_check_skipped_when_one_side_empty(con):
     assert result["anomalies"] == []
 
 
-def test_cross_instrument_check_runs_when_both_populated(con):
+def test_cross_instrument_check_ignores_pre_overlap_and_post_overlap_dates(con):
+    """
+    Mirrors the real D05.SI (starts 2000) vs ^STI (starts 1990) situation
+    that produced false anomalies on the first live run: ^STI has dates
+    before D05.SI's history begins, and D05.SI has a date after ^STI's
+    last date in this fixture. Neither should be flagged - the overlap
+    restriction added after that run should exclude them entirely.
+    """
+    index_dates = _sample_df([
+        (date(2000, 1, 3), 1400.0),   # pre-overlap: before D05.SI's first date - must NOT be flagged
+        (date(2000, 1, 4), 1401.0),   # pre-overlap: same
+        (date(2000, 6, 1), 1500.0),
+        (date(2000, 6, 2), 1502.0),
+        (date(2000, 6, 5), 1510.0),   # inside overlap, D05.SI missing this one - SHOULD be flagged
+    ])
+    security_dates = _sample_df([
+        (date(2000, 6, 1), 40.0),
+        (date(2000, 6, 2), 40.5),
+        (date(2000, 6, 7), 41.0),     # post-overlap: after ^STI's last date in this fixture - must NOT be flagged
+    ])
+
     con.execute("BEGIN TRANSACTION")
-    prices_mod._upsert_normalized(con, "prices_daily", "security_id", 1,
-                                   _sample_df([(date(2026, 1, 5), 40.0)]))
-    prices_mod._upsert_normalized(con, "index_daily", "index_id", 1,
-                                   _sample_df([(date(2026, 1, 5), 3300.0), (date(2026, 1, 6), 3310.0)]))
+    prices_mod._upsert_normalized(con, "index_daily", "index_id", 1, index_dates)
+    prices_mod._upsert_normalized(con, "prices_daily", "security_id", 1, security_dates)
     con.execute("COMMIT")
 
     result = check_cross_instrument_date_consistency(con)
+
     assert result["skipped"] is False
-    assert len(result["anomalies"]) == 1  # 2026-01-06 present in index only
+    assert result["overlap_start"] == date(2000, 6, 1)   # max(2000-06-01, 2000-01-03)
+    assert result["overlap_end"] == date(2000, 6, 5)      # min(2000-06-07, 2000-06-05)
+
+    flagged_dates = {a["trade_date"] for a in result["anomalies"]}
+    # Pre-overlap ^STI-only dates must be absent:
+    assert date(2000, 1, 3) not in flagged_dates
+    assert date(2000, 1, 4) not in flagged_dates
+    # Post-overlap D05.SI-only date must be absent:
+    assert date(2000, 6, 7) not in flagged_dates
+    # The genuine in-window anomaly must still be caught:
+    assert date(2000, 6, 5) in flagged_dates
+    assert len(result["anomalies"]) == 1
 
 
 # --- yfinance exception handling --------------------------------------------

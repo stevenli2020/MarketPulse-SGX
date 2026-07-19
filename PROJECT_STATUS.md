@@ -1,9 +1,28 @@
 # MarketPulse SGX — Project Status
 
 **Last updated:** 2026-07-19
-**Phase:** 2 — Real price/index ingestion. **Hardening patch applied following a full code review. Live execution against yfinance/DuckDB still blocked by this sandbox's network allowlist — see "Execution environment limitation" below. Not yet run against real data.**
+**Phase:** 2 — Real price/index ingestion. **First real ingestion run completed successfully outside this sandbox (WSL). One data-quality correction applied afterward (cross-instrument overlap window) — see below. Phase 2 substantively complete; awaiting sign-off before Phase 3.**
 
 ---
+
+## First real ingestion run — actual results (2026-07-19, run by Steven in WSL)
+
+| Metric | D05.SI (prices_daily) | ^STI (index_daily) |
+|---|---|---|
+| Rows | 6,720 | 9,137 |
+| Date range | 2000-01-03 to 2026-07-17 | 1990-01-02 to 2026-07-17 |
+| Rejected rows | 0 | 0 |
+| Warnings | 83 (zero/null-volume) | — |
+
+Both instruments loaded successfully into DuckDB. This is the first confirmed real result in this project — everything reported before this point (Phase 2 code review, hardening patch) was written/offline-verified only, per the honesty notes in this file's earlier sections; those notes are left in place below rather than deleted, since they're an accurate record of what happened at the time.
+
+**Not yet separately confirmed:** the yfinance ex-dividend field-mapping check (Close vs. Adj Close against a known DBS ex-dividend date) — this run confirms ingestion works end-to-end, but that specific verification step hasn't been reported back yet.
+
+## Post-run correction: cross-instrument consistency check was too broad
+
+The real data exposed a real problem: `check_cross_instrument_date_consistency()` compared full history on both sides, and because ^STI's history (from 1990) starts 10 years before D05.SI's (from 2000, when it was listed), every pre-2000 ^STI date was flagged as a false "D05.SI missing" anomaly. Likely SG public holidays (e.g. 2000-05-01, 2000-08-09, 2000-12-25, 2001-01-01) also showed up as anomalies within that mismatched range - confirming this check was never a reliable generic holiday-gap detector (consistent with the module's own docstring, which already disclaimed this).
+
+**Fix applied (2026-07-19):** the check now restricts its comparison to the overlapping date range only - `max(first date of either instrument)` through `min(last date of either instrument)`. Dates outside that window are not evaluated at all (not reclassified as "fine" - they were never a fair comparison in the first place). No SG holiday calendar was added - none was needed once the comparison is scoped correctly, and none is planned at this stage per instruction. See `validation/checks.py::check_cross_instrument_date_consistency` for the exact change and its docstring.
 
 ## Decisions log
 
@@ -14,11 +33,39 @@
 | 2026-07-18 | Phase 2 scope | Approved and implemented: D05.SI + ^STI OHLCV ingestion, DuckDB storage, raw preservation, normalized storage, duplicate handling, validation, cross-instrument date consistency check, basic data-quality reporting. |
 | 2026-07-18 | Phase 2 revisions (6 changes) | Approved and implemented: explicit `auto_adjust=False`; renamed `raw_prices_daily`→`prices_daily`, `raw_index_daily`→`index_daily`; split fetch audit into `price_fetches` + `raw_price_rows`; reframed gap check as "cross-instrument date consistency / anomaly detection"; added explicit `availability_date` point-in-time convention; fail-loud on empty/invalid source response. |
 | 2026-07-19 | Code review | Full review against 10 points; found 2 CRITICAL (no transaction/rollback → possible partial normalized data), 4 IMPORTANT (yfinance exception handling gap, unverified MultiIndex level assumption, revision-logging not implemented, cross-instrument check could run on one-sided data), 1 MINOR (listing-date check missing). |
-| 2026-07-19 | Hardening patch | Approved and implemented: all 2 CRITICAL and 4 IMPORTANT findings fixed, plus the 1 MINOR finding restored. Details below. |
+| 2026-07-19 | Hardening patch | Approved and implemented: all 2 CRITICAL and 4 IMPORTANT findings fixed, plus the 1 MINOR finding restored. |
+| 2026-07-19 | First real ingestion run (WSL) | **Successful** — see results table above. |
+| 2026-07-19 | Cross-instrument overlap-window correction | Approved and implemented: consistency check restricted to `max(first dates)` through `min(last dates)`; no SG holiday calendar added. |
 
 ---
 
-## Files changed (Phase 2 hardening patch, 2026-07-19)
+## Files changed (overlap-window correction, 2026-07-19, post-real-run)
+
+- `validation/checks.py` — `check_cross_instrument_date_consistency()`: computes `overlap_start = max(MIN(prices_daily.trade_date), MIN(index_daily.trade_date))` and `overlap_end = min(MAX(...), MAX(...))`; both existing `LEFT JOIN` queries gained a `WHERE trade_date BETWEEN overlap_start AND overlap_end` clause. Return value gained `overlap_start`/`overlap_end` keys. Added a guard for the (currently theoretical) case where the two instruments' ranges don't overlap at all. No other logic changed; the empty-table skip guard, the anomaly wording, and everything else in the function is untouched.
+- `scripts/run_ingestion.py` — prints the overlap window being used, for transparency, when the check runs.
+- `tests/test_phase2_ingestion.py` — replaced the old trivial cross-instrument test with `test_cross_instrument_check_ignores_pre_overlap_and_post_overlap_dates`, built to mirror the real D05.SI/^STI shape (one instrument's history starting years before the other's, plus a trailing date past the other's last date) and asserting both that out-of-window dates are never flagged and that a genuine in-window anomaly still is. The empty-side skip test is unchanged.
+
+**Nothing else touched, per instruction:** `ingestion/prices.py` (transaction, revision, yfinance exception, MultiIndex, listing-date hardening) is unmodified; no new tables; no holiday calendar dependency added.
+
+## Tests run for this correction
+
+Real DuckDB is still unavailable in this sandbox, but this function's SQL (`COUNT`, `MIN`/`MAX`, `LEFT JOIN`, `WHERE ... BETWEEN ? AND ?`, `ORDER BY`) is plain ANSI SQL with no DuckDB-specific syntax - so the **actual, unmodified `check_cross_instrument_date_consistency()` function** was run here against an in-memory SQLite connection standing in for DuckDB (not a reimplementation of its logic). Results:
+
+| Assertion | Result |
+|---|---|
+| Empty-side skip still returns `skipped=True`, no anomalies | PASS |
+| Overlap window computed correctly (`max`/`min` of both instruments' ranges) | PASS |
+| Pre-overlap ^STI-only dates (mirroring 2000-01-03, 2000-01-04) NOT flagged | PASS |
+| Post-overlap D05.SI-only date NOT flagged | PASS |
+| Genuine in-window anomaly IS still flagged | PASS |
+| Exactly one anomaly reported (not the pre/post-overlap noise) | PASS |
+| "review, not confirmed missing data" wording preserved | PASS |
+
+All 7 assertions passed. The full `pytest` suite (including this test as it now stands in the actual test file) still could not be run here — same unavailable-`pytest`/`duckdb` limitation as before — but the underlying logic is now confirmed correct via the SQLite stand-in, which is a stronger check than the pure-Python logic checks used earlier in this document, since it exercises the real SQL rather than a hand-simulation of it.
+
+---
+
+
 
 - `ingestion/prices.py` — rewritten: (1) the normalized-table update portion of `_ingest_one` (upsert → revision logging → coverage log update) is now wrapped in an explicit `BEGIN TRANSACTION` / `COMMIT` / `ROLLBACK`, so a failure partway through cannot leave partial rows in `prices_daily`/`index_daily`; a new `NormalizationFailure` exception (subclass of `IngestionFailure`) is raised on rollback; (2) `_upsert_normalized` now pre-fetches existing rows and classifies each incoming row as insert / unchanged-skip / revised-update, instead of an unconditional `ON CONFLICT DO UPDATE`; revised rows are logged as `price_revision_detected` warnings with the old/new values; (3) the `yfinance.download()` call itself is now wrapped in try/except so any exception it raises (network error, rate limit, etc.) is converted to `IngestionFailure` and recorded in `price_fetches`, rather than propagating unhandled; (4) MultiIndex column flattening now inspects both levels for the OHLCV field names instead of assuming level 0, and raises `IngestionFailure` with the actual returned columns if neither level matches; (5) `_ingest_one` now looks up `dim_securities.listed_date` and passes it into validation.
 - `validation/checks.py` — `validate_price_rows()` gained a `listed_date` parameter; rows before it are rejected (the check is a no-op if `listed_date` is `None`). `check_cross_instrument_date_consistency()` now checks both tables' row counts first and returns `{"skipped": True, "reason": ...}` instead of comparing if either is empty.
