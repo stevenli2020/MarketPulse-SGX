@@ -1,0 +1,21 @@
+# Core data handling
+duckdb==1.0.0
+pandas==2.2.2
+numpy==1.26.4
+
+# Data collection (not yet wired in - see ingestion/ stubs)
+yfinance==0.2.40
+
+# Modeling (not yet used - added now so the pinned stack is decided upfront)
+scikit-learn==1.5.1
+xgboost==2.1.0
+shap==0.46.0
+
+# Backtesting (not yet used)
+vectorbt==0.26.2
+
+# UI (not yet used)
+streamlit==1.37.0
+
+# Testing
+pytest==8.3.2
