@@ -1,8 +1,8 @@
 # MarketPulse SGX — Project Specification (v2)
 
 **Status:** Planning / specification — supersedes the v1 spec with a more rigorous, more detailed version. No architecture already agreed in Phase 0/1 has been silently changed; two genuinely new items surfaced by this revision (a banking-sector peer feature group, and news/sentiment) are flagged explicitly in Sections 7 and 5 rather than folded in quietly.
-**Owner:** Steven
-**Lead architect/developer:** Claude
+**Owner:** Sprite
+**Lead architect/developer:** Cola
 **Last updated:** 2026-07-18
 
 ---
@@ -31,7 +31,7 @@ MarketPulse SGX will explicitly **not**:
 
 ---
 
-## 3. User Workflow (Steven, end to end)
+## 3. User Workflow (Sprite, end to end)
 
 1. Open the Streamlit app. Land on a single page showing DBS's current status: last close, recent trend, and whether enough data exists to generate a prediction (some early history may be excluded due to feature warm-up windows — see Section 6).
 2. Select a horizon: 5 or 10 trading days.
@@ -39,7 +39,7 @@ MarketPulse SGX will explicitly **not**:
 4. See *why*: the top features driving that probability (SHAP-based, in plain language), plus a list of the most similar historical trading days and what happened after each of them (situation matching, Section 9).
 5. See the model's honesty section: its walk-forward backtested accuracy, calibration, and how it compares to the naive baselines (Section 11) — displayed every time, not just on request, so a bad result is never hidden behind a good-looking headline number.
 6. Optionally browse a "data health" page: what data exists, its date range, and any known gaps or quality caveats.
-7. Steven does not place, size, or track any position through this tool. Any investment decision remains entirely his own, made outside the system.
+7. Sprite does not place, size, or track any position through this tool. Any investment decision remains entirely his own, made outside the system.
 
 ---
 
@@ -83,7 +83,7 @@ V1 explicitly does **not** need to support: multiple securities, sentiment/news 
 3. **Weak prior for a stock at this coverage level.** DBS is already extremely well covered by professional analysts; the market-moving news about DBS is priced in fast. There's no strong reason to expect a simple sentiment score to add much at a 5–10 day horizon, though this is a hypothesis worth testing later, not now.
 4. **Scope discipline.** Per Rule 8 (simplest working version first), the project should prove the core price/volume/macro/fundamentals pipeline works and is leakage-free before adding a whole new, harder-to-validate data category.
 
-**Decision (Steven, 2026-07-18): EXCLUDED from V1.** No news-related tables, ingestion code, or architecture will be created in V1. Formally recorded as a candidate **V2 research experiment** — to be evaluated only after the core pipeline has a proven, credible baseline result to compare against, treating sentiment as a candidate feature to test for incremental value, not an assumed improvement.
+**Decision (Sprite, 2026-07-18): EXCLUDED from V1.** No news-related tables, ingestion code, or architecture will be created in V1. Formally recorded as a candidate **V2 research experiment** — to be evaluated only after the core pipeline has a proven, credible baseline result to compare against, treating sentiment as a candidate feature to test for incremental value, not an assumed improvement.
 
 ---
 
@@ -191,7 +191,7 @@ The requested "banking sector" grouping (comparing DBS to OCBC (O39.SI) and UOB 
 - Two more `raw_prices_daily` ingestion feeds to build and validate.
 - Two more sources of data-quality risk (gaps, adjustments) before this feature group can be trusted.
 
-**Decision (Steven, 2026-07-18): DEFERRED. Not part of V1. Recorded as a possible V1.1 extension**, to be revisited once the core single-stock pipeline (DBS + STI) is proven end to end.
+**Decision (Sprite, 2026-07-18): DEFERRED. Not part of V1. Recorded as a possible V1.1 extension**, to be revisited once the core single-stock pipeline (DBS + STI) is proven end to end.
 
 ---
 
@@ -218,7 +218,7 @@ The requested "banking sector" grouping (comparing DBS to OCBC (O39.SI) and UOB 
 2. Normalize each feature (z-score, using only data available as of the query date — mean/stdev computed over history up to that date, not the full dataset, to avoid leakage).
 3. Compute the Euclidean distance between today's normalized feature vector and every historical date's normalized feature vector (using only dates where the full forward-looking outcome is already known, i.e. at least 10 trading days in the past).
 4. Rank historical dates by distance (closest = most similar); take the top 15–20.
-5. For those matched dates, compute the percentage that had a positive 5-day forward return, and separately a positive 10-day forward return. This percentage *is* the plain-English probability statement shown to Steven.
+5. For those matched dates, compute the percentage that had a positive 5-day forward return, and separately a positive 10-day forward return. This percentage *is* the plain-English probability statement shown to Sprite.
 6. Store the matched dates and their outcomes in `situation_matches` so the UI can show the actual historical dates behind any given probability — full traceability, no hidden step.
 
 This is deliberately simple (k-nearest-neighbors by Euclidean distance — no learned weights, no neural embeddings) so every step is auditable by hand if needed. Per Section 17, this method has real limitations (regime change means "similar-looking" days may not behave similarly today) and should be presented as one input, not the final word.
@@ -313,7 +313,7 @@ No new files needed for the spec revision itself. If the optional peer-bank feat
 
 | Phase | Objective | Built | Not yet built | Acceptance criteria |
 |---|---|---|---|---|
-| **0 — Spec** ✅ done | Define architecture and risks before code | PROJECT_SPEC.md, PROJECT_STATUS.md | Nothing | Steven sign-off |
+| **0 — Spec** ✅ done | Define architecture and risks before code | PROJECT_SPEC.md, PROJECT_STATUS.md | Nothing | Sprite sign-off |
 | **1 — Skeleton** ✅ done | Establish project structure | Folder structure, `config.py`, `db/schema.sql`, `db/connection.py`, all stub modules | Any real data logic | Schema runs cleanly; entry point runs without error (verified) |
 | **2 — Price/index ingestion** ← next | Prove one real, validated data source end to end | Real `ingestion/prices.py`, real `validation/checks.py` for prices | Macro, fundamentals, features, labels | D05.SI and ^STI daily OHLCV loaded into DuckDB, gap-checked, logged to `data_availability_log` |
 | **3 — Macro ingestion** | Add rate/FX data with correct `as_of_date` | Real `ingestion/macro.py` | Fundamentals, features, labels | SORA, Fed funds, FX loaded with correct availability dates |
@@ -322,7 +322,7 @@ No new files needed for the spec revision itself. If the optional peer-bank feat
 | **6 — Random Forest & XGBoost** | Test whether added complexity earns its keep | RF and XGBoost models, SHAP | Fundamentals, situation matching, UI | Model comparison honestly reported vs Logistic Regression and baselines |
 | **7 — Fundamentals** | Add the weakest, highest-effort data pillar | `ingestion/fundamentals.py`, fundamentals features | Situation matching, UI | Re-test whether fundamentals features add anything measurable |
 | **8 — Situation matching** | Add explainability layer | KNN-based matching (Section 9) | UI | Matches and outcomes stored and spot-checkable by hand |
-| **9 — Streamlit UI** | Make it usable | Prediction view, explanation view, backtest dashboard, data health page | Peer-bank features, sentiment | Steven can run the full workflow (Section 3) end to end |
+| **9 — Streamlit UI** | Make it usable | Prediction view, explanation view, backtest dashboard, data health page | Peer-bank features, sentiment | Sprite can run the full workflow (Section 3) end to end |
 
 Each phase's acceptance criteria must pass before the next phase starts — this is unchanged from the Build Order agreed in Phase 0.
 

@@ -1,11 +1,11 @@
 # MarketPulse SGX — Project Status
 
 **Last updated:** 2026-07-19
-**Phase:** 2 — Real price/index ingestion. **Successfully run against real data in Steven's WSL environment with real DuckDB and yfinance 1.5.1 (see the yfinance version compatibility audit below — 0.2.40 failed, 1.5.1 succeeded). One post-run data-quality correction applied and verified (cross-instrument overlap window). One outstanding item identified as a genuine scope gap, not a bug (ex-dividend/corporate-action event data) — recommendation below. Phase 2 substantively complete; awaiting sign-off before Phase 3.**
+**Phase:** 2 — Real price/index ingestion. **Successfully run against real data in Sprite's WSL environment with real DuckDB and yfinance 1.5.1 (see the yfinance version compatibility audit below — 0.2.40 failed, 1.5.1 succeeded). One post-run data-quality correction applied and verified (cross-instrument overlap window). One outstanding item identified as a genuine scope gap, not a bug (ex-dividend/corporate-action event data) — recommendation below. Phase 2 substantively complete; awaiting sign-off before Phase 3.**
 
 ---
 
-## First real ingestion run — actual results (2026-07-19, run by Steven in WSL, real DuckDB + real yfinance)
+## First real ingestion run — actual results (2026-07-19, run by Sprite in WSL, real DuckDB + real yfinance)
 
 | Metric | D05.SI (`prices_daily`) | ^STI (`index_daily`) |
 |---|---|---|
@@ -14,7 +14,7 @@
 | Rejected rows | 0 | 0 |
 | Warnings | 83 (zero/null-volume) | — |
 
-Both instruments loaded successfully. **This confirms DuckDB and yfinance both work correctly end-to-end in the actual project environment.** Earlier sections of this file's history (below) describe extensive testing done in Claude's own development sandbox, which has no network access and could not install DuckDB or yfinance at all — that limitation was specific to the sandbox used to *write* the code, never a statement about the real project environment. Any earlier wording in this file that could be read as implying DuckDB "hasn't run" refers only to that authoring sandbox and has been corrected below.
+Both instruments loaded successfully. **This confirms DuckDB and yfinance both work correctly end-to-end in the actual project environment.** Earlier sections of this file's history (below) describe extensive testing done in Cola's own development sandbox, which has no network access and could not install DuckDB or yfinance at all — that limitation was specific to the sandbox used to *write* the code, never a statement about the real project environment. Any earlier wording in this file that could be read as implying DuckDB "hasn't run" refers only to that authoring sandbox and has been corrected below.
 
 ---
 
@@ -35,7 +35,7 @@ Inspected `ingestion/prices.py`, `db/schema.sql`, and `validation/checks.py` dir
 ### What Phase 2 *does* do, and what that does and doesn't tell us
 The code does store both `close` (actual traded price) and `adj_close` (yfinance's dividend/split-adjusted series) as separate columns — this was the original goal from the initial Phase 2 review round ("preserve the distinction between actual historical OHLC prices and adjusted close/total-return-oriented price"), and that distinction *is* structurally preserved. What it does **not** give is a discrete, dated *event* ("DBS paid a S$0.54 dividend, ex-date 2024-08-15") — only the net cumulative effect embedded in the adj_close series.
 
-I don't have access to Steven's real DuckDB file to check this myself. To actually verify the close-vs-adj_close mapping behaves as expected, I found a real, well-documented DBS ex-dividend date via web search (cross-confirmed by two independent sources: moomoo.com and tipranks.com) — **2024-08-15, dividend S$0.54/share**. Steven, run this against your real database:
+I don't have access to Sprite's real DuckDB file to check this myself. To actually verify the close-vs-adj_close mapping behaves as expected, I found a real, well-documented DBS ex-dividend date via web search (cross-confirmed by two independent sources: moomoo.com and tipranks.com) — **2024-08-15, dividend S$0.54/share**. Sprite, run this against your real database:
 
 ```sql
 SELECT trade_date, close, adj_close
@@ -59,17 +59,17 @@ What to look for: `adj_close` should be **lower than** `close` for dates *before
 ## yfinance version compatibility audit (2026-07-19, final — corrects a mistaken intermediate entry)
 
 **This entry is the authoritative record.** This file has gone through two incorrect states on this question before landing here, and both corrections are recorded for transparency rather than erased:
-1. An entry pinned `1.4.1`, reasoning from PyPI release notes ("latest stable, no breaking changes") without confirmed evidence of what actually worked in Steven's environment.
+1. An entry pinned `1.4.1`, reasoning from PyPI release notes ("latest stable, no breaking changes") without confirmed evidence of what actually worked in Sprite's environment.
 2. A subsequent entry incorrectly reverted to `0.2.40`, based on a mistaken claim that `0.2.40` was the version that had actually succeeded.
-3. **Steven has now directly corrected the record with the actual tested sequence, which this entry reflects.**
+3. **Sprite has now directly corrected the record with the actual tested sequence, which this entry reflects.**
 
-**Confirmed sequence, as reported by Steven:**
+**Confirmed sequence, as reported by Sprite:**
 - `yfinance==0.2.40` (the original pin) was tested directly against **both D05.SI and AAPL** and **failed both times** with `JSONDecodeError`/empty DataFrame.
 - `yfinance` was then manually upgraded to **`1.5.1`** in the active `.venv`.
 - The first successful live ingestion — D05.SI: 6,720 rows, 2000-01-03 to 2026-07-17; ^STI: 9,137 rows, 1990-01-02 to 2026-07-17, 0 rejected — occurred under **`1.5.1`**.
 
 **What I could and couldn't verify myself:**
-- **Actual installed version in `/mnt/d/Projects/MarketPulse-SGX/github/.venv`:** I cannot access Steven's WSL filesystem or execute anything in that `.venv` — I have no tool that reaches it. I am not guessing a number; this is taken entirely from Steven's direct report.
+- **Actual installed version in `/mnt/d/Projects/MarketPulse-SGX/github/.venv`:** I cannot access Sprite's WSL filesystem or execute anything in that `.venv` — I have no tool that reaches it. I am not guessing a number; this is taken entirely from Sprite's direct report.
 - **Independent check on `1.5.1` itself:** I confirmed via a fresh PyPI/GitHub release check that `yfinance 1.5.1` is a real release (June 28, 2026, currently the latest) — this at least rules out the number being a typo for a nonexistent version.
 - **API compatibility:** `ingestion/prices.py`'s only yfinance call, `yfinance.download(ticker, start=, end=, auto_adjust=, progress=)`, uses the same four keyword arguments regardless of which of these versions is installed — nothing in this project's code is version-conditional, so no code change is implied by this pin change.
 
@@ -89,7 +89,7 @@ The real data exposed a real problem: `check_cross_instrument_date_consistency()
 
 **Fix applied (2026-07-19):** the check now restricts its comparison to the overlapping date range only — `max(first date of either instrument)` through `min(last date of either instrument)`. Dates outside that window are not evaluated at all (not reclassified as "fine" — they were never a fair comparison in the first place). No SG holiday calendar was added.
 
-**Verification:** since this function's SQL (`COUNT`, `MIN`/`MAX`, `LEFT JOIN`, `WHERE ... BETWEEN ? AND ?`) is plain ANSI SQL, the actual unmodified function was run in Claude's sandbox against an in-memory SQLite stand-in (not a reimplementation), using a fixture shaped like the real D05.SI/^STI situation. All 7 assertions passed: pre-overlap and post-overlap dates correctly excluded, a genuine in-window anomaly correctly still caught, the "review, not confirmed missing data" wording preserved, and the pre-existing empty-side skip behavior unaffected. `tests/test_phase2_ingestion.py` was updated with a permanent test (`test_cross_instrument_check_ignores_pre_overlap_and_post_overlap_dates`) covering the same scenario for when real `pytest`/`duckdb` are available.
+**Verification:** since this function's SQL (`COUNT`, `MIN`/`MAX`, `LEFT JOIN`, `WHERE ... BETWEEN ? AND ?`) is plain ANSI SQL, the actual unmodified function was run in Cola's sandbox against an in-memory SQLite stand-in (not a reimplementation), using a fixture shaped like the real D05.SI/^STI situation. All 7 assertions passed: pre-overlap and post-overlap dates correctly excluded, a genuine in-window anomaly correctly still caught, the "review, not confirmed missing data" wording preserved, and the pre-existing empty-side skip behavior unaffected. `tests/test_phase2_ingestion.py` was updated with a permanent test (`test_cross_instrument_check_ignores_pre_overlap_and_post_overlap_dates`) covering the same scenario for when real `pytest`/`duckdb` are available.
 
 ---
 
@@ -105,7 +105,7 @@ The real data exposed a real problem: `check_cross_instrument_date_consistency()
 | 2026-07-19 | Hardening patch | Approved and implemented: all CRITICAL/IMPORTANT findings fixed, MINOR finding restored. |
 | 2026-07-19 | First real ingestion run (WSL, real DuckDB + real yfinance) | **Successful** — see results table above. |
 | 2026-07-19 | Cross-instrument overlap-window correction | Approved, implemented, and verified against the real-data failure mode. |
-| 2026-07-19 | Ex-dividend/corporate-action field mapping review | **Not implemented in Phase 2** (genuine scope gap, not a bug). Deferred to Build Order step 8. No code changed. SQL query for Steven to self-verify close-vs-adj_close behavior provided above. |
+| 2026-07-19 | Ex-dividend/corporate-action field mapping review | **Not implemented in Phase 2** (genuine scope gap, not a bug). Deferred to Build Order step 8. No code changed. SQL query for Sprite to self-verify close-vs-adj_close behavior provided above. |
 | 2026-07-19 | yfinance version compatibility audit | **Finalized.** Confirmed sequence: `0.2.40` tested and failed against both D05.SI and AAPL; `1.5.1` installed and produced the first successful live ingestion. `requirements.txt` corrected to `yfinance==1.5.1`. Two earlier entries in this file (upgrade to `1.4.1`, then an incorrect revert to `0.2.40`) were both wrong and are superseded by this one. |
 
 ---
@@ -136,14 +136,14 @@ The real data exposed a real problem: `check_cross_instrument_date_consistency()
 
 - Ex-dividend/corporate-action event data — confirmed not implemented, deferred to Build Order step 8 (see above).
 - Macro, fundamentals, features, labeling, situation matching, ML, news/sentiment, Streamlit UI — all still out of scope for Phase 2, unchanged from Phase 1.
-- `pytest`-based execution of `tests/test_phase2_ingestion.py` and `tests/test_leakage.py` has not happened in Claude's development sandbox (no network to install `pytest`/`duckdb`) — but Steven's WSL environment now has both installed and working, so this should be run there next.
+- `pytest`-based execution of `tests/test_phase2_ingestion.py` and `tests/test_leakage.py` has not happened in Cola's development sandbox (no network to install `pytest`/`duckdb`) — but Sprite's WSL environment now has both installed and working, so this should be run there next.
 
 ## Known open risks
 
-Unchanged from PROJECT_SPEC.md Section 17, plus: the close-vs-adj_close mapping is still only structurally verified (separate columns, sourced from separate yfinance fields) and not yet empirically confirmed against Steven's real data — the SQL query above is the next step to close that gap. No corporate-action event data exists yet, so any future feature or label that would benefit from knowing "was this a dividend day" specifically (as opposed to just using adjusted returns) isn't currently possible — acceptable for now, since Build Order step 8 covers it.
+Unchanged from PROJECT_SPEC.md Section 17, plus: the close-vs-adj_close mapping is still only structurally verified (separate columns, sourced from separate yfinance fields) and not yet empirically confirmed against Sprite's real data — the SQL query above is the next step to close that gap. No corporate-action event data exists yet, so any future feature or label that would benefit from knowing "was this a dividend day" specifically (as opposed to just using adjusted returns) isn't currently possible — acceptable for now, since Build Order step 8 covers it.
 
 ## Next recommended action
 
 Two independent, non-blocking next steps, either order:
-1. Steven runs the SQL query above against the real DuckDB file to close the close/adj_close verification gap.
+1. Sprite runs the SQL query above against the real DuckDB file to close the close/adj_close verification gap.
 2. Once that's done and reviewed, Phase 3 (macro ingestion — SORA, Fed funds rate) can begin. **Not started yet, per instruction.**
