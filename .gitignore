@@ -1,3 +1,14 @@
-.venv/
+# DuckDB database file - regenerable from ingestion scripts, not versioned
+*.duckdb
+
+# Python
+__pycache__/
+*.pyc
 venv/
-.git/
+.venv/
+
+# Local environment / secrets
+.env
+
+# OS
+.DS_Store
