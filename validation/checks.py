@@ -106,6 +106,77 @@ def validate_price_rows(df: pd.DataFrame, ticker: str, entity_type: str, listed_
     return valid_rows, rejected_rows, warnings
 
 
+def validate_macro_rows(records: list, series_id: str):
+    """
+    Row-level validation for one macro series' normalized records
+    (Phase 3). Mirrors validate_price_rows's shape and split between
+    hard rejections and soft warnings.
+
+    Returns (valid_rows, rejected_rows, warnings) - same shape as
+    validate_price_rows, so callers and the data-quality report can
+    treat both uniformly.
+    """
+    valid_rows = []
+    rejected_rows = []
+    warnings = []
+
+    # Deliberately broad, not tight - the instruction is explicit not to
+    # invent overly restrictive business rules that could reject
+    # legitimate historical data. These bounds exist only to catch
+    # obvious parsing/unit errors (e.g. a rate of 99999), not to express
+    # an opinion about what a "normal" rate or FX level is.
+    bounds = {
+        "SORA": (-10.0, 100.0),              # a rate, in percent
+        "US_FED_FUNDS_RATE": (-10.0, 100.0),  # a rate, in percent
+        "SGD_USD_FX": (0.01, 100.0),          # a price ratio
+    }
+    lo, hi = bounds.get(series_id, (-1e9, 1e9))
+
+    for rec in records:
+        reasons = []
+
+        obs_date = rec.get("obs_date")
+        as_of_date = rec.get("as_of_date")
+        value = rec.get("value")
+
+        if value is None or pd.isna(value):
+            reasons.append("value is null")
+        if obs_date is None:
+            reasons.append("obs_date is missing")
+        if as_of_date is None:
+            reasons.append("as_of_date is missing")
+
+        if obs_date is not None and as_of_date is not None:
+            if as_of_date < obs_date:
+                reasons.append(
+                    f"as_of_date ({as_of_date}) is before obs_date ({obs_date}) - "
+                    "a value cannot be knowable before the period it describes"
+                )
+
+        if value is not None and not pd.isna(value):
+            if value < lo or value > hi:
+                reasons.append(f"value {value} outside sanity bounds [{lo}, {hi}] for {series_id}")
+
+        if reasons:
+            rejected_rows.append({"obs_date": obs_date, "reasons": reasons})
+            continue
+
+        if as_of_date is not None and obs_date is not None and as_of_date == obs_date and series_id != "SGD_USD_FX":
+            # For rate series (SORA, Fed funds), as_of_date == obs_date
+            # would mean "knowable on the same day it describes" - not
+            # impossible, but unusual enough for a macro release to be
+            # worth a warning rather than silent acceptance.
+            warnings.append({
+                "warning_type": "as_of_equals_obs_date",
+                "obs_date": obs_date,
+                "detail": f"{series_id} {obs_date}: as_of_date equals obs_date - unusual for a rate release, worth reviewing",
+            })
+
+        valid_rows.append(rec)
+
+    return valid_rows, rejected_rows, warnings
+
+
 def check_cross_instrument_date_consistency(con) -> dict:
     """
     Compares trade dates present in prices_daily (D05.SI) against
@@ -224,6 +295,22 @@ def generate_data_quality_report(con) -> str:
     lines.append("Coverage:")
     for row in coverage:
         lines.append(f"  {row[0]} (entity_id={row[1]}): {row[2]} to {row[3]}, {row[4]} rows, last updated {row[5]}")
+
+    # Macro coverage is computed directly from raw_macro_series rather
+    # than data_availability_log (Phase 3): that table's entity_id column
+    # is INTEGER, which doesn't fit a macro series_id like "SORA" without
+    # a schema change - avoided per instruction to change schema only for
+    # a genuine defect. This achieves the same reporting goal without one.
+    macro_coverage = con.execute(
+        "SELECT series_id, MIN(obs_date), MAX(obs_date), COUNT(*) "
+        "FROM raw_macro_series GROUP BY series_id ORDER BY series_id"
+    ).fetchall()
+    lines.append("\nMacro series coverage:")
+    if macro_coverage:
+        for series_id, start, end, count in macro_coverage:
+            lines.append(f"  {series_id}: {start} to {end}, {count} rows")
+    else:
+        lines.append("  none")
 
     warning_counts = con.execute(
         "SELECT warning_type, COUNT(*) FROM data_quality_warnings GROUP BY warning_type"

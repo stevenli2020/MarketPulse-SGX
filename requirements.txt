@@ -3,6 +3,12 @@ duckdb==1.0.0
 pandas==2.2.2
 numpy==1.26.4
 
+# HTTP client for Phase 3 macro sources (MAS API, FRED CSV/API). Already
+# a transitive dependency of yfinance; pinned explicitly here rather
+# than relying on that indirect fact, since ingestion/macro.py imports
+# it directly.
+requests==2.32.3
+
 # Data collection - see PROJECT_STATUS.md "yfinance version compatibility
 # audit" entry (2026-07-19, final). Confirmed sequence: 0.2.40 (the
 # original pin) FAILED against both D05.SI and AAPL with

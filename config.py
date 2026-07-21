@@ -9,6 +9,7 @@ here instead, so there is exactly one place to change it.
 """
 
 from pathlib import Path
+import os
 
 # --- Storage ---------------------------------------------------------------
 
@@ -35,13 +36,56 @@ INDICES = [
     {"ticker": "^STI", "name": "Straits Times Index"},
 ]
 
-# --- Macro series to collect (ingestion not yet implemented) ---------------
+# --- Macro series to collect (Phase 3) --------------------------------------
 
 MACRO_SERIES = [
     "SORA",
     "US_FED_FUNDS_RATE",
     "SGD_USD_FX",
 ]
+
+MACRO_HISTORY_START_DATE = "1990-01-01"  # same floor as PRICE_HISTORY_START_DATE
+
+# Optional. Read from the environment only - never hardcoded or committed.
+# If unset, US_FED_FUNDS_RATE falls back to FRED's public, no-key CSV
+# endpoint (see ingestion/macro.py) rather than requiring registration.
+FRED_API_KEY = os.environ.get("FRED_API_KEY")
+
+# Per-series source configuration. Kept as one dict so a source decision
+# (URL, field names) lives in exactly one place, per this project's
+# existing configuration style (see SECURITIES/INDICES above).
+MACRO_SOURCE_CONFIG = {
+    "SORA": {
+        "source": "MAS_API",
+        "base_url": "https://eservices.mas.gov.sg/api/action/datastore/search.json",
+        # Official MAS "Domestic Interest Rates" dataset. This resource_id
+        # was found via a documented third-party technical walkthrough of
+        # the official MAS datastore API (mas.gov.sg/Statistics/APIs/API-
+        # Documentation.aspx confirms the API pattern itself), not from
+        # MAS's own docs directly, and could not be independently verified
+        # against the live endpoint in this development environment (no
+        # network access - see PROJECT_STATUS.md). MUST be confirmed on
+        # first real run; ingestion/macro.py fails loudly with the actual
+        # returned field names if this assumption is wrong, rather than
+        # silently mismapping data - see _identify_sora_value_field().
+        "resource_id": "9a0bf149-308c-4bd2-832d-76c8e6cb47ed",
+        "date_field": "end_of_day",
+        # Candidate field names for the raw (non-compounded) daily SORA
+        # rate - genuinely uncertain which one the live API uses, see
+        # comment above. Tried in order; first present column wins.
+        "value_field_candidates": ["sora", "sora_rate", "overnight_sora"],
+    },
+    "US_FED_FUNDS_RATE": {
+        "source": "FRED",
+        "series_id": "EFFR",
+        "csv_url": "https://fred.stlouisfed.org/graph/fredgraph.csv",
+        "api_url": "https://api.stlouisfed.org/fred/series/observations",
+    },
+    "SGD_USD_FX": {
+        "source": "yfinance",
+        "ticker": "USDSGD=X",  # per instruction: do not substitute SGDUSD=X
+    },
+}
 
 # --- Prediction horizons -----------------------------------------------------
 # Used later by labeling/labels.py. Defined here so features and labels

@@ -1,5 +1,5 @@
 """
-CLI entry point for Phase 2: D05.SI and ^STI daily OHLCV ingestion.
+CLI entry point for Phase 2 (price/index) and Phase 3 (macro) ingestion.
 
 Usage (run as a module from the project root):
     python -m scripts.run_ingestion
@@ -12,15 +12,19 @@ This script:
      D05.SI and ^STI ingestion succeeded in this run AND both normalized
      tables are non-empty (see validation/checks.py hardening note).
      Otherwise, reports that the check was skipped and why.
-  5. Prints the data-quality report.
+  5. Runs macro ingestion for each series in config.MACRO_SERIES (SORA,
+     US_FED_FUNDS_RATE, SGD_USD_FX). A macro series failure is reported
+     explicitly per series and never silently treated as success.
+  6. Prints the data-quality report (now including macro coverage).
 
-Only Phase 2 scope: no macro, fundamentals, features, situation
-matching, ML, or UI here - see PROJECT_STATUS.md.
+Phase 3 scope only extends to macro data STORAGE - no feature
+engineering, labeling, or modeling is invoked here. See PROJECT_STATUS.md.
 """
 
 from db.connection import get_connection
-from config import SECURITIES, INDICES
+from config import SECURITIES, INDICES, MACRO_SERIES
 from ingestion.prices import fetch_security_prices, fetch_index_prices, IngestionFailure
+from ingestion.macro import fetch_macro_series
 from validation.checks import check_cross_instrument_date_consistency, generate_data_quality_report
 
 
@@ -93,10 +97,40 @@ def main():
             else:
                 print("  none found")
 
+    print("\nMacro ingestion (Phase 3) ...")
+    macro_run_ok = True
+    for series_id in MACRO_SERIES:
+        print(f"Ingesting {series_id} ...")
+        try:
+            result = fetch_macro_series(series_id)
+            results.append(result)
+            print(f"  OK: {result['rows_received']} received, {result['rows_rejected']} rejected, "
+                  f"{result['rows_inserted']} inserted, {result['rows_updated_revised']} revised, "
+                  f"{result['rows_unchanged']} unchanged, {result['warnings']} warnings, "
+                  f"coverage {result['coverage_start']} to {result['coverage_end']}")
+        except IngestionFailure as e:
+            macro_run_ok = False
+            print(f"  FAILED (no partial data committed): {e}")
+
     print("\n" + generate_data_quality_report(con))
 
-    return results
+    # FIX (Macha audit, Issue 2): previously security_run_ok/index_run_ok
+    # were tracked but never actually used to affect the process exit
+    # code, and macro ingestion wasn't tracked at all - a failure would
+    # print an error but the script would still exit 0 (success) as far
+    # as the OS/any calling automation is concerned. Now surfaced
+    # explicitly via the return value, with sys.exit() set accordingly
+    # in the __main__ block below (kept out of main() itself so main()
+    # remains a plain, importable/testable function, not something that
+    # terminates the process as a side effect).
+    overall_ok = security_run_ok and index_run_ok and macro_run_ok
+    if not overall_ok:
+        print("\nOne or more ingestion steps failed this run - see FAILED lines above.")
+
+    return results, overall_ok
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    _, ok = main()
+    sys.exit(0 if ok else 1)

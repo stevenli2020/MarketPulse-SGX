@@ -1,11 +1,83 @@
 # MarketPulse SGX — Project Status
 
 **Last updated:** 2026-07-19
-**Phase:** 2 — Real price/index ingestion. **Successfully run against real data in Sprite's WSL environment with real DuckDB and yfinance 1.5.1 (see the yfinance version compatibility audit below — 0.2.40 failed, 1.5.1 succeeded). One post-run data-quality correction applied and verified (cross-instrument overlap window). One outstanding item identified as a genuine scope gap, not a bug (ex-dividend/corporate-action event data) — recommendation below. Phase 2 substantively complete; awaiting sign-off before Phase 3.**
+**Phase:** 3 — Macro ingestion (SORA, US Fed funds rate, SGD/USD FX). **Implemented, syntax-checked, and logic-verified in Cola's development sandbox via mocked/stand-in tests. Macha's architecture/code audit found 2 issues requiring remediation (multi-vintage lookup keying bug, missing exit-code propagation) — both confirmed real and fixed; see "Response to Macha's architecture/code audit" below. NOT yet run live in Sprite's WSL environment; `pytest tests/test_phase3_macro_ingestion.py -v` still needs to be run there before the live macro ingestion step.** Phase 2 remains closed and unmodified by this work. Awaiting Sprite's WSL test results before the live run.
 
 ---
 
-## First real ingestion run — actual results (2026-07-19, run by Sprite in WSL, real DuckDB + real yfinance)
+## Phase 3 implementation record (2026-07-19)
+
+### Files modified
+- **`config.py`** — added `MACRO_HISTORY_START_DATE`, `FRED_API_KEY` (read from environment, never hardcoded), and `MACRO_SOURCE_CONFIG` (per-series source URLs/identifiers, one place per this project's existing configuration style).
+- **`ingestion/macro.py`** — full implementation, replacing the stub. Source adapters for SORA (MAS API), US_FED_FUNDS_RATE (FRED, vintage-aware or CSV fallback), SGD_USD_FX (yfinance); common normalization to `{series_id, obs_date, value, as_of_date, source}`; transaction-wrapped upsert into `raw_macro_series` with idempotent/revision classification; fail-loud on any unusable source response. Imports `IngestionFailure`/`NormalizationFailure` from `ingestion.prices` rather than redefining them.
+- **`validation/checks.py`** — added `validate_macro_rows()`; extended `generate_data_quality_report()` to include macro coverage (computed directly from `raw_macro_series`, not `data_availability_log` — see Data model impact below).
+- **`scripts/run_ingestion.py`** — extended to run macro ingestion for each series in `config.MACRO_SERIES` after the existing price/index/consistency-check flow, with per-series failure reporting that can never silently read as success.
+- **`requirements.txt`** — added `requests==2.32.3` (explicit; was already a transitive `yfinance` dependency, now used directly for MAS/FRED HTTP calls).
+
+### Files added
+- **`tests/test_phase3_macro_ingestion.py`** — 19 deterministic tests, mocking all external source calls, mirroring `tests/test_phase2_ingestion.py`'s structure.
+
+### Files explicitly NOT touched
+`db/schema.sql` — no schema change. `raw_macro_series` (`series_id`, `obs_date`, `value`, `as_of_date`, `source`, `ingested_at`, PK on all three of `series_id`/`obs_date`/`as_of_date`) was already sufficient; nothing here required altering it. `features/feature_engineering.py`, `labeling/labels.py` — confirmed untouched (unchanged file timestamps). `ingestion/prices.py`, Phase 2's tests — confirmed unmodified.
+
+### Exact source used per series
+| Series | Source | Endpoint |
+|---|---|---|
+| `SORA` | MAS official datastore API | `https://eservices.mas.gov.sg/api/action/datastore/search.json?resource_id=9a0bf149-308c-4bd2-832d-76c8e6cb47ed` — **resource_id found via a third-party technical walkthrough of this official API, not MAS's own docs directly, and NOT independently verified against the live endpoint (no network access in this sandbox). Needs confirmation on first real run.** The value field name is similarly unconfirmed; the code tries `["sora", "sora_rate", "overnight_sora"]` in order and fails loud with the actual returned field names if none match. |
+| `US_FED_FUNDS_RATE` | FRED | If `FRED_API_KEY` set: `https://api.stlouisfed.org/fred/series/observations?series_id=EFFR` with the full-vintage trick (`realtime_start=1776-07-04`) for genuine release-date metadata. If unset: the public, no-key CSV endpoint `https://fred.stlouisfed.org/graph/fredgraph.csv?id=EFFR`, exactly as specified. |
+| `SGD_USD_FX` | yfinance `1.5.1` | Ticker `USDSGD=X`, exactly as specified — not substituted with `SGDUSD=X`. |
+
+### `obs_date` / `as_of_date` convention per series
+- **SORA:** `as_of_date = obs_date + 1 Singapore business day`, via `pandas.tseries.offsets.BDay(1)` — weekday-only, does not account for SG public holidays (disclosed limitation; no holiday-calendar package added, per instruction). This matches MAS's own stated practice (confirmed via web search: *"SORA for a given business day will be published by 9.00am on the next business day"*).
+- **US_FED_FUNDS_RATE:** if `FRED_API_KEY` is set, `as_of_date` is the real `realtime_start` from FRED's vintage data — the actual first-published date. If not set, falls back explicitly to `obs_date + 1 business day` (never silently collapsed to `obs_date`).
+- **SGD_USD_FX:** `as_of_date = obs_date = trade_date`, matching the existing Phase 2 equity/index convention exactly.
+
+### Look-ahead prevention at the storage layer
+`validate_macro_rows()` hard-rejects any row where `as_of_date < obs_date` before it can reach `raw_macro_series` — a value cannot be knowable before the period it describes. This is enforced at validation time, not just documented. Downstream Phase 4 code (not designed here) can enforce `WHERE as_of_date <= cutoff_date` uniformly across `raw_macro_series`, `prices_daily`, and `index_daily`, since all three now carry the same point-in-time-filtering column pattern.
+
+### Tests run and results
+**Not executed via `pytest`** — `duckdb`, `yfinance`, and `pytest` remain uninstallable in this sandbox (confirmed: PyPI unreachable, same constraint as every prior phase). Cannot claim what wasn't run.
+
+**What was actually executed**, using the real `ingestion.macro`/`validation.checks` modules (not reimplementations), with `yfinance`/`duckdb` stood in only enough to satisfy imports, and the real `requests` library with mocked HTTP responses:
+- 14 direct-execution checks: SORA/FRED/FX normalization correctness, SORA's unknown-field fail-loud diagnostic, the T+1 business-day calculation, FRED's vintage-vs-fallback `as_of_date` distinction, `validate_macro_rows`'s rejection/acceptance behavior (including confirming negative rates are accepted, not rejected), and fail-loud behavior for a request exception, an empty response, and an unrecognized CSV shape. **All 14 passed.**
+- 4 additional checks against `_upsert_macro_series` using an in-memory SQLite stand-in (this function's SQL is portable, like Phase 2's cross-instrument check): idempotent re-ingestion, genuine revision detection, no duplicate rows across repeated runs, and transaction rollback leaving zero partial rows. **All 4 passed** — after first hitting and correctly diagnosing a SQLite-stand-in artifact (SQLite has no native DATE type, so dates round-trip as strings unlike DuckDB's native type; fixed by registering a DATE converter in the test harness only, not in the actual code).
+
+**Existing Phase 2 tests:** re-ran the full Phase 2 compile check across every file (10 files, includes `ingestion/prices.py`, `validation/checks.py`, `scripts/run_ingestion.py`) — all still compile cleanly. `tests/test_phase2_ingestion.py` itself was not re-executed here for the same duckdb-unavailability reason as before; no evidence of any Phase 2 regression from a read-through diff (the only shared file touched, `validation/checks.py`, had `validate_macro_rows` and a report extension added, with `validate_price_rows`/`check_cross_instrument_date_consistency` left byte-for-byte in place above/below the new function).
+
+### Remaining uncertainty
+1. **SORA `resource_id` and value-field name are unverified against the live MAS API.** This is the single biggest open risk in this implementation — flagged clearly, not glossed over. First real run will either confirm it or fail loud with the actual field names, which is the intended behavior either way.
+2. **FRED CSV/API exact response shape** — implemented from well-documented, verified patterns (confirmed modern `observation_date`/`<series_id>` column shape via search), but not executed against the live endpoint.
+3. **Whether `USDSGD=X` returns data cleanly via yfinance `1.5.1`** — same category of uncertainty Phase 2 had for `D05.SI`/`^STI` before its first real run; the code reuses the exact proven pattern.
+4. **19 written tests in `tests/test_phase3_macro_ingestion.py` have not been run via real pytest** — ready to run once Sprite has `duckdb`/`pytest` installed (already true in the WSL `.venv` per Phase 2).
+
+### Confirmation
+**Phase 4 Feature Engineering was not started or designed.** `features/feature_engineering.py` and `labeling/labels.py` are confirmed untouched (unchanged file timestamps, unchanged content).
+
+## Response to Macha's architecture/code audit (2026-07-19)
+
+Two issues were identified as requiring remediation before the live test run. Both were independently verified against the actual code (not accepted on claim alone) before fixing.
+
+### Issue 1 (REVISION REQUIRED → FIXED): multi-vintage lookup keying bug in `ingestion/macro.py`
+
+**Confirmed real.** `_fetch_existing_macro()` built its lookup dictionary keyed by `obs_date` alone: `{r[0]: {...} for r in rows}`. If more than one `as_of_date` vintage existed for the same `obs_date` (a real, if edge-case, scenario — e.g. `FRED_API_KEY` being added to the environment between runs, switching an observation from the fallback `as_of_date` convention to real FRED vintage data), the dict comprehension would silently keep only one of them, in unspecified order. `_upsert_macro_series` would then compare an incoming row against whichever vintage happened to survive, potentially misclassifying a genuine revision, or attempting a raw `INSERT` that collides with the real primary key `(series_id, obs_date, as_of_date)` — the code's own docstring incorrectly claimed this was protected by an `ON CONFLICT` clause that was never actually present.
+
+**Fix:** `_fetch_existing_macro()` now keys its lookup by the full `(obs_date, as_of_date)` tuple, exactly matching the real PK. `_upsert_macro_series()` was simplified accordingly — a lookup miss now unambiguously means "no row exists for this exact vintage," so an `INSERT` can never collide with an existing PK. A new, distinct event type (`new_vintage_for_existing_obs_date`) was added to separately flag the case where a genuinely new vintage arrives for an `obs_date` that already has other vintages on record, rather than conflating it with an ordinary value revision.
+
+**Verified:** re-ran the full existing idempotency/revision test suite against the fix (all still pass), plus a new targeted test reproducing the exact bug scenario (two vintages pre-existing for one `obs_date`, a revision arriving that must match the correct one) — confirmed the fix resolves it: the revision is matched against the right vintage, no duplicate row or PK collision results. This scenario is now a permanent regression test (`test_multi_vintage_lookup_matches_correct_vintage_not_arbitrary_one`) in `tests/test_phase3_macro_ingestion.py`, bringing the file to 19 test functions.
+
+### Issue 2 (REVISION REQUIRED → FIXED): pipeline failure not propagated to exit code in `scripts/run_ingestion.py`
+
+**Confirmed real, and pre-existing since Phase 2** (not a new Phase 3 regression, though Phase 3 continued the pattern rather than catching it): `security_run_ok`/`index_run_ok` were tracked but never used to set a process exit code, and macro ingestion wasn't tracked at all. A failure printed an error line but the script always exited 0, indistinguishable from success to any calling automation.
+
+**Fix:** added `macro_run_ok` tracking; `main()` now returns `(results, overall_ok)`; the `if __name__ == "__main__":` block calls `sys.exit(0 if ok else 1)`. Kept the exit call out of `main()` itself so it remains a plain, importable/testable function.
+
+### FRED vintage semantics — explicit documentation (Macha items 5/14)
+
+To state this precisely, as requested: when `FRED_API_KEY` is set, `as_of_date` for `US_FED_FUNDS_RATE` is the **FRED Vintage Knowledge Date** — the `realtime_start` value returned by FRED's ALFRED vintage system for that specific observation, representing the actual date that value was first published/known, not an approximation. This is only available on the API-key path; the no-key CSV fallback path has no such metadata and uses the documented `obs_date + 1 business day` fallback instead, as already stated above.
+
+---
+
+
 
 | Metric | D05.SI (`prices_daily`) | ^STI (`index_daily`) |
 |---|---|---|
@@ -144,6 +216,6 @@ Unchanged from PROJECT_SPEC.md Section 17, plus: the close-vs-adj_close mapping 
 
 ## Next recommended action
 
-Two independent, non-blocking next steps, either order:
-1. Sprite runs the SQL query above against the real DuckDB file to close the close/adj_close verification gap.
-2. Once that's done and reviewed, Phase 3 (macro ingestion — SORA, Fed funds rate) can begin. **Not started yet, per instruction.**
+Phase 3 (macro ingestion) has now been implemented — see the Phase 3 implementation record and Macha audit-response sections above. Two independent, non-blocking next steps remain:
+1. Sprite runs the ex-dividend/corporate-action SQL query (Phase 2 section above) against the real DuckDB file, to close that verification gap.
+2. Sprite runs `python -m pytest tests/test_phase3_macro_ingestion.py -v` in the WSL `.venv`, per Macha's instruction, and reports the results back before the live macro ingestion run proceeds.
