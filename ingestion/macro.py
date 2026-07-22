@@ -96,12 +96,89 @@ def _identify_sora_value_field(sample_record: dict, series_id: str) -> str:
     )
 
 
+def _describe_response_for_diagnostics(resp) -> str:
+    """
+    Builds a human-readable diagnostic block from an HTTP response, for
+    when a request "succeeds" at the transport level (no exception, no
+    4xx/5xx) but the body isn't the JSON we expected - exactly the
+    reported JSONDecodeError: "Expecting value: line 1 column 1 (char 0)",
+    which happens when .json() is called on an empty or non-JSON body.
+    A bare exception message doesn't say WHY; this does.
+    """
+    content_type = resp.headers.get("Content-Type", "<not set>")
+    body_snippet = resp.text[:500] if resp.text else "<empty body>"
+    looks_like_html = resp.text.strip().lower().startswith(("<!doctype", "<html"))
+    looks_like_json = resp.text.strip().startswith(("{", "["))
+
+    if not resp.text or not resp.text.strip():
+        interpretation = (
+            "Response body is completely empty. Common causes for MAS's eServices "
+            "API specifically: the request was blocked before reaching the actual "
+            "API handler (e.g. a WAF/security layer rejecting requests without a "
+            "browser-like User-Agent header - see the User-Agent now sent by this "
+            "client), rate limiting, or the resource_id no longer exists."
+        )
+    elif looks_like_html:
+        interpretation = (
+            "Response body is HTML, not JSON - almost certainly an error page, "
+            "login/block page, or a redirect target, not the datastore API response. "
+            "This points to a wrong URL/resource_id or a request being intercepted "
+            "before reaching the API, not a transient network issue."
+        )
+    elif looks_like_json:
+        interpretation = (
+            "Response body appears to start like JSON but failed to parse - likely "
+            "truncated (a network/timeout issue mid-response) or malformed."
+        )
+    else:
+        interpretation = (
+            "Response body does not look like JSON or HTML - inspect the raw body "
+            "snippet below directly."
+        )
+
+    return (
+        f"HTTP status: {resp.status_code}\n"
+        f"Final URL: {resp.url}\n"
+        f"Content-Type: {content_type}\n"
+        f"Response headers: {dict(resp.headers)}\n"
+        f"Body looks like JSON: {looks_like_json} | Body looks like HTML: {looks_like_html}\n"
+        f"First 500 chars of body: {body_snippet!r}\n"
+        f"Engineering interpretation: {interpretation}"
+    )
+
+
+# Government/institutional endpoints (MAS's eServices platform included)
+# commonly reject or silently short-circuit requests that don't carry a
+# browser-like User-Agent, returning an empty or non-JSON body rather
+# than a clean error status - exactly the reported symptom. This is a
+# defensive, standard hardening step for calling such APIs, not a
+# fabricated fix - added after finding a working third-party example of
+# this exact API that explicitly sets one. Does not change the request
+# semantics (same URL, same params) otherwise.
+_SORA_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
+
 def _fetch_sora_raw(start_date: str, end_date: str) -> list:
     """
     Fetches raw SORA records from the official MAS datastore API,
     paginating via offset (the API caps at 100 rows per call).
     Raises IngestionFailure on any unusable response or request
-    exception - never returns partial results silently.
+    exception - never returns partial results silently, never retries
+    indefinitely (each call is attempted exactly once), never
+    substitutes fallback data.
+
+    DIAGNOSTIC ENHANCEMENT (2026-07-19, after a live JSONDecodeError):
+    a bare ".json() failed" message doesn't say why. On any failure to
+    parse the response as JSON, the full diagnostic block from
+    _describe_response_for_diagnostics() is included in the
+    IngestionFailure message - status code, headers, Content-Type, a
+    body snippet, the final URL, JSON-vs-HTML detection, and a plain-
+    English interpretation - so the actual cause is visible from the
+    error message itself, not just "it failed".
     """
     cfg = MACRO_SOURCE_CONFIG["SORA"]
     all_records = []
@@ -117,13 +194,30 @@ def _fetch_sora_raw(start_date: str, end_date: str) -> list:
             "sort": f"{cfg['date_field']} asc",
         }
         try:
-            resp = requests.get(cfg["base_url"], params=params, timeout=30)
-            resp.raise_for_status()
-            payload = resp.json()
+            resp = requests.get(cfg["base_url"], params=params, headers=_SORA_REQUEST_HEADERS, timeout=30)
         except IngestionFailure:
             raise
         except Exception as e:
-            raise IngestionFailure(f"SORA: MAS API request failed: {e!r}") from e
+            # A genuine transport-level exception (DNS failure, connection
+            # refused, timeout) - not a "successful" response with a bad
+            # body, which is handled separately below with richer context.
+            raise IngestionFailure(f"SORA: MAS API request failed (transport-level exception): {e!r}") from e
+
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            raise IngestionFailure(
+                f"SORA: MAS API returned an HTTP error status.\n{_describe_response_for_diagnostics(resp)}\n"
+                f"Underlying exception: {e!r}"
+            ) from e
+
+        try:
+            payload = resp.json()
+        except Exception as e:
+            raise IngestionFailure(
+                f"SORA: MAS API response could not be parsed as JSON.\n{_describe_response_for_diagnostics(resp)}\n"
+                f"Underlying exception: {e!r}"
+            ) from e
 
         result = payload.get("result")
         if result is None or "records" not in result:

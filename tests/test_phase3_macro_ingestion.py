@@ -42,6 +42,58 @@ def con():
 # Source adapter normalization
 # =============================================================================
 
+def test_sora_json_decode_error_produces_rich_diagnostics():
+    """
+    Reproduces the exact live failure reported after MP-P3-027
+    (JSONDecodeError: Expecting value: line 1 column 1 (char 0), i.e. an
+    empty response body) and confirms the enhanced diagnostics include
+    HTTP status, final URL, Content-Type, a body snippet, and a plain-
+    English interpretation - not just a bare "request failed" message.
+    """
+    import json as json_mod
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.url = "https://eservices.mas.gov.sg/api/action/datastore/search.json?resource_id=test"
+    mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+    mock_resp.text = ""
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.side_effect = json_mod.JSONDecodeError("Expecting value", "", 0)
+
+    with patch.object(macro_mod.requests, "get", return_value=mock_resp):
+        with pytest.raises(macro_mod.IngestionFailure) as exc_info:
+            macro_mod._fetch_sora_raw("1990-01-01", "2026-07-19")
+
+    msg = str(exc_info.value)
+    assert "HTTP status: 200" in msg
+    assert "Final URL:" in msg
+    assert "Content-Type: text/html" in msg
+    assert "Engineering interpretation:" in msg
+
+
+def test_sora_request_sends_browser_like_user_agent():
+    """
+    Regression test: MAS's eServices platform is understood to reject or
+    silently short-circuit requests without a browser-like User-Agent
+    (see config.py's MACRO_SOURCE_CONFIG["SORA"] comment). Confirms this
+    client actually sends one, not just documents the intent to.
+    """
+    captured = {}
+
+    def capture_get(*args, **kwargs):
+        captured.update(kwargs)
+        m = MagicMock()
+        m.status_code = 200
+        m.raise_for_status = MagicMock()
+        m.json.return_value = {"result": {"records": [{"end_of_day": "2024-01-02", "sora": "3.5"}], "total": 1}}
+        return m
+
+    with patch.object(macro_mod.requests, "get", capture_get):
+        macro_mod._fetch_sora_raw("2024-01-01", "2024-01-05")
+
+    assert "User-Agent" in captured.get("headers", {})
+    assert "Mozilla" in captured["headers"]["User-Agent"]
+
+
 def test_sora_normalization_maps_fields_correctly():
     records = [
         {"end_of_day": "2024-01-02", "sora": "3.5123"},

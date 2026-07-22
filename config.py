@@ -68,6 +68,22 @@ MACRO_SOURCE_CONFIG = {
         # first real run; ingestion/macro.py fails loudly with the actual
         # returned field names if this assumption is wrong, rather than
         # silently mismapping data - see _identify_sora_value_field().
+        #
+        # UPDATE (2026-07-19, after a live JSONDecodeError - empty/
+        # non-JSON response body): a second, independently-sourced
+        # technical walkthrough of this same MAS API uses a DIFFERENT
+        # resource_id: "5f2b18a8-0883-4769-a635-879c63d3caac". I have not
+        # verified which (if either) is currently correct for daily SORA
+        # specifically - I'm not swapping this value based on an
+        # unverified second source, since that would just be trading one
+        # unverified guess for another. What I did change: added a
+        # browser-like User-Agent header (see _SORA_REQUEST_HEADERS in
+        # ingestion/macro.py), since that second source explicitly needed
+        # one, and MAS's eServices platform silently rejecting requests
+        # without one is a well-documented pattern for exactly this
+        # empty-body symptom. If the enhanced diagnostics (also added)
+        # show this resource_id genuinely doesn't exist (e.g. an explicit
+        # "not found" in the response body), try the alternate ID above.
         "resource_id": "9a0bf149-308c-4bd2-832d-76c8e6cb47ed",
         "date_field": "end_of_day",
         # Candidate field names for the raw (non-compounded) daily SORA

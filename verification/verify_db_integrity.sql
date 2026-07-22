@@ -71,10 +71,21 @@ GROUP BY warning_type;
 
 -- Coverage sanity: MIN/MAX obs_date within plausible bounds
 -- (MACRO_HISTORY_START_DATE to today). Expected: ZERO rows outside this.
+--
+-- NOTE (fixed after first live run, 2026-07-19): originally used bare
+-- CURRENT_DATE here, which DuckDB's binder rejected in this GROUP
+-- BY/HAVING context with "column CURRENT_DATE must appear in the GROUP
+-- BY clause or be used in an aggregate function" - a known DuckDB
+-- quirk where the niladic CURRENT_DATE keyword (no parentheses) gets
+-- parsed as a column reference rather than the current-date function in
+-- some clause positions. today() is DuckDB's unambiguous function-call
+-- equivalent and is not subject to this ambiguity. Same fix applied to
+-- verify_db_integrity.py. The check's meaning and coverage are
+-- unchanged - only the syntax used to express "today" changed.
 SELECT series_id, MIN(obs_date) AS earliest, MAX(obs_date) AS latest
 FROM raw_macro_series
 GROUP BY series_id
-HAVING MIN(obs_date) < DATE '1990-01-01' OR MAX(obs_date) > CURRENT_DATE;
+HAVING MIN(obs_date) < DATE '1990-01-01' OR MAX(obs_date) > today();
 
 -- Impossible values: outside the same broad sanity bounds
 -- validate_macro_rows enforces at insert time (rates: -10 to 100;

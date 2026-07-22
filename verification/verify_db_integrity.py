@@ -77,9 +77,13 @@ def main():
           "before this logging existed) was captured. Documented as a known limitation, not silently assumed complete.")
 
     print("\nData quality:")
+    # NOTE (fixed after first live run): bare CURRENT_DATE inside this
+    # GROUP BY/HAVING query triggered a DuckDB binder error - see
+    # verify_db_integrity.sql for the full explanation. today() is the
+    # unambiguous fix; the check's meaning is unchanged.
     results.append(_check(con, "coverage within plausible bounds (1990-01-01 to today)",
         "SELECT series_id, MIN(obs_date), MAX(obs_date) FROM raw_macro_series GROUP BY series_id "
-        "HAVING MIN(obs_date) < DATE '1990-01-01' OR MAX(obs_date) > CURRENT_DATE"))
+        "HAVING MIN(obs_date) < DATE '1990-01-01' OR MAX(obs_date) > today()"))
     results.append(_check(con, "no impossible values (out of sanity bounds)",
         "SELECT * FROM raw_macro_series WHERE "
         "(series_id IN ('SORA', 'US_FED_FUNDS_RATE') AND (value < -10.0 OR value > 100.0)) "

@@ -121,6 +121,38 @@ Both instruments loaded successfully. **This confirms DuckDB and yfinance both w
 
 ---
 
+## MP-P3-028 — SORA endpoint investigation, DuckDB SQL fix (2026-07-19)
+
+**Trigger:** Sprite's first full WSL verification run. Results: rollback, logging/exit-code, FRED, and Yahoo Finance FX all **PASS**. DuckDB integrity and SORA **FAILED**; idempotency blocked as a consequence of the SORA failure (expected — no SORA data to re-run against).
+
+### SORA investigation: `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`
+
+**Root cause:** this error means `.json()` was called on an empty or non-JSON response body. The prior implementation had no diagnostics beyond the bare exception — no way to tell *why* from the error alone.
+
+**What I could and couldn't determine:** I don't have network access to MAS's live endpoint from this sandbox, so I could not reproduce the failure directly or confirm the exact cause with certainty. What I did find via research: a second, independently-sourced technical walkthrough of this same MAS API uses a **different** `resource_id` (`5f2b18a8-0883-4769-a635-879c63d3caac`) than the one currently configured (`9a0bf149-308c-4bd2-832d-76c8e6cb47ed`), and — notably — that working example explicitly sets a browser-like `User-Agent` header. Government/institutional APIs silently rejecting requests without one (returning an empty body rather than a clean error) is a well-documented pattern, and it matches the reported symptom exactly.
+
+**What I changed, and what I deliberately did not:**
+1. **Added a browser-like `User-Agent` header** to the SORA request (`ingestion/macro.py`, `_SORA_REQUEST_HEADERS`). Well-evidenced, safe, standard hardening — not a guess.
+2. **Did NOT swap the `resource_id`** to the second candidate. I can't verify which (if either) is correct for daily SORA specifically without a live call, and substituting one unverified guess for another isn't a fix — it's moving the uncertainty around. Both IDs are now documented in `config.py` with the reasoning, so Sprite can try the alternate quickly if the first still fails.
+3. **Added rich failure diagnostics** (`_describe_response_for_diagnostics()` in `ingestion/macro.py`): on any JSON-parse or HTTP-error failure, the `IngestionFailure` message now includes HTTP status code, full response headers, `Content-Type`, the final requested URL, a JSON-vs-HTML heuristic, the first 500 characters of the response body, and a plain-English interpretation of the likely cause. **Verified working** by reproducing the exact reported error (empty body, `Content-Type: text/html`) against a mocked response and confirming the diagnostic output is correct and complete — see `test_sora_json_decode_error_produces_rich_diagnostics` (new permanent regression test).
+4. The ingestion layer still fails loud: no exception suppression, no silent infinite retry (each call attempts once), no fallback data substitution. Confirmed via `test_sora_request_sends_browser_like_user_agent` and the existing fail-loud tests, all still passing.
+
+**If SORA still fails after this fix:** the next failure's error message will itself contain enough information (status code, actual body content, headers) to diagnose definitively, rather than requiring another round of guessing. If the response body indicates the current `resource_id` doesn't exist, try the alternate ID documented in `config.py`.
+
+### DuckDB integrity verification: `Binder Error: column CURRENT_DATE must appear in the GROUP BY clause or be used in an aggregate function`
+
+**Root cause:** the "coverage within plausible bounds" check (`verification/verify_db_integrity.py` / `.sql`) used bare `CURRENT_DATE` inside a `HAVING` clause following `GROUP BY series_id`. This triggers a known DuckDB binder quirk where the niladic `CURRENT_DATE` keyword (no parentheses) gets parsed as a column reference in that clause position, rather than resolved as the current-date value.
+
+**Fix:** replaced `CURRENT_DATE` with `today()` — DuckDB's unambiguous function-call equivalent — in both the SQL file and the Python runner. No check was removed, no coverage was reduced; only the syntax used to express "today" changed. The other `CURRENT_DATE` usage in the same file (`WHERE obs_date > CURRENT_DATE`, no `GROUP BY`) was left as-is, since it isn't in the affected clause position and isn't broken — changing it too would have been an unrelated, unjustified edit.
+
+### Regression check (Task 4)
+Re-verified after both fixes, all passing: SORA/FRED/FX normalization unaffected, `as_of_date < obs_date` validation unaffected, the future-`obs_date` fix from the prior turn unaffected, transport-exception fail-loud behavior unaffected, empty-records fail-loud behavior unaffected, duplicate prevention, revision handling, and transaction rollback all unaffected (re-verified via the SQLite-substitution technique established in earlier phases). `tests/test_phase3_macro_ingestion.py` now has 22 test functions (+2 for this turn's SORA diagnostic fix).
+
+### What remains unverified
+Everything requiring live network access or a real DuckDB file — same constraint as every prior phase. This fix is my best-evidence response to a real reported failure, not a confirmed resolution. **Production sign-off cannot be granted from this turn alone** — it requires Sprite re-running the full verification suite in WSL and the SORA/DuckDB checks actually passing there.
+
+---
+
 ## Outstanding verification: ex-dividend / corporate-action field mapping
 
 **Status: not implemented in Phase 2 — this is a genuine scope gap, not a bug, and no code was changed as a result of this review (per instruction: only fix if a genuine bug is found).**
