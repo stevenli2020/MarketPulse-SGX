@@ -132,6 +132,8 @@ def validate_macro_rows(records: list, series_id: str):
     }
     lo, hi = bounds.get(series_id, (-1e9, 1e9))
 
+    today = date.today()
+
     for rec in records:
         reasons = []
 
@@ -145,6 +147,17 @@ def validate_macro_rows(records: list, series_id: str):
             reasons.append("obs_date is missing")
         if as_of_date is None:
             reasons.append("as_of_date is missing")
+
+        # DEFECT FIX (discovered while building the Phase 3.5 integrity
+        # verification package, 2026-07-19): validate_price_rows already
+        # rejects a future trade_date; this function had no equivalent
+        # check for obs_date, an asymmetry between the two validation
+        # functions rather than a deliberate decision. No legitimate
+        # source should ever return a future observation, but this closes
+        # the same defense-in-depth gap validate_price_rows already
+        # covers, rather than leaving macro data as the one exception.
+        if obs_date is not None and obs_date > today:
+            reasons.append(f"obs_date ({obs_date}) is in the future")
 
         if obs_date is not None and as_of_date is not None:
             if as_of_date < obs_date:

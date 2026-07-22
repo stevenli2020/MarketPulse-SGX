@@ -53,7 +53,38 @@
 ### Confirmation
 **Phase 4 Feature Engineering was not started or designed.** `features/feature_engineering.py` and `labeling/labels.py` are confirmed untouched (unchanged file timestamps, unchanged content).
 
-## Response to Macha's architecture/code audit (2026-07-19)
+## Phase 3.5 — Live Verification Package (2026-07-19)
+
+**Objective:** verification tooling only, no new functionality, no Phase 4 work. Package delivered; **not yet run live** — same sandbox constraint as every prior phase (no network, no `duckdb`/`yfinance` installable here). Awaiting Sprite's WSL execution and the completed report.
+
+### Defect discovered and fixed while building the integrity checks
+While designing the "invalid dates" integrity check, found that `validate_macro_rows()` had **no check rejecting a future `obs_date`** — an asymmetry with `validate_price_rows()`, which already has one. No legitimate source should ever return future data, but this closed a real defense-in-depth gap rather than leaving macro data as the one exception. Fixed with the minimal equivalent check; verified with 3 direct checks (future date rejected, valid historical row still accepted, existing `as_of_date < obs_date` check unaffected) and a new permanent regression test, `test_validate_macro_rows_rejects_future_obs_date` (`tests/test_phase3_macro_ingestion.py`, now 20 test functions). No other ingestion/validation logic was touched.
+
+### Files added
+- `verification/verify_live_ingestion.py` — runs real ingestion against all 3 configured macro sources, reports PASS/FAIL per source against connection/download/normalization/validation/storage checkpoints (read off `fetch_macro_series`'s own return value, not by instrumenting internals).
+- `verification/verify_db_integrity.sql` — raw SQL integrity queries (row counts, duplicate PK, NULLs, invalid dates, revision integrity, value bounds), each documented with its expected "healthy" result. Explicitly documents that "orphan records" is not applicable to `raw_macro_series` (no FK relationships).
+- `verification/verify_db_integrity.py` — executes the same checks and reports PASS/FAIL programmatically.
+- `verification/verify_idempotency.py` — runs live ingestion twice back to back, compares row counts and revision counts; flags any Run 2 revisions as "review required" rather than auto-failing, since a genuine upstream revision in the gap between runs is possible and this script can't distinguish that from a logic error with certainty.
+- `verification/verify_rollback.py` — forces a failure via monkeypatching against an isolated, temporary DuckDB file (never touches the real project database), confirms zero partial rows remain. **Verified working in Cola's sandbox** using the fake-module/SQLite-substitution technique established in earlier phases — the underlying `_ingest_one_series` → `NormalizationFailure` → rollback mechanism was confirmed correct directly, not just assumed.
+- `verification/verify_logging_and_exit_code.py` — confirms failure messages are specific/readable and that `scripts/run_ingestion.py::main()` correctly propagates failure to its return value (and therefore the process exit code). **Actually executed end to end in Cola's sandbox** (fully mocked, no live sources or real DB needed) — both checks passed, and this directly re-confirmed the exit-code fix from the earlier architecture audit still works.
+- `verification/run_all_verifications.py` — single entry point running all five stages in a safe order (isolated checks first, live-data checks after), printing a final summary.
+- `PHASE3_5_VERIFICATION_REPORT_TEMPLATE.md` — structured report template for Sprite to complete after running the package in WSL.
+
+### What was actually verified in Cola's sandbox vs. what needs a live WSL run
+| Script | Sandbox status |
+|---|---|
+| `verify_rollback.py` | Underlying mechanism directly confirmed correct (SQLite stand-in for the isolated temp-DB logic) |
+| `verify_logging_and_exit_code.py` | **Executed end to end for real** (fully mocked, no live dependencies needed) — passed |
+| `verify_live_ingestion.py` | Not executable here — needs live network access to MAS/FRED/Yahoo |
+| `verify_db_integrity.py` / `.sql` | Not executable here — needs a populated real DuckDB file |
+| `verify_idempotency.py` | Not executable here — needs live network access, run twice |
+
+### Architecture boundaries maintained
+No feature engineering, labeling, model training, prediction logic, backtesting, or schema redesign was added. `features/feature_engineering.py` and `labeling/labels.py` remain untouched (unchanged timestamps). Only verification tooling and the one disclosed validation-layer defect fix were added.
+
+---
+
+
 
 Two issues were identified as requiring remediation before the live test run. Both were independently verified against the actual code (not accepted on claim alone) before fixing.
 

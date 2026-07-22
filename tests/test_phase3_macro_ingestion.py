@@ -304,6 +304,23 @@ def test_fx_source_exception_raises_ingestion_failure(monkeypatch):
 # Validation edge cases
 # =============================================================================
 
+def test_validate_macro_rows_rejects_future_obs_date():
+    """
+    Regression test for a defect found while building the Phase 3.5
+    integrity verification package: validate_macro_rows had no check
+    rejecting a future obs_date, unlike validate_price_rows which already
+    does. No legitimate source should return one, but this closes the
+    same defense-in-depth gap validate_price_rows already covers.
+    """
+    from datetime import timedelta
+    records = [{"series_id": "SORA", "obs_date": date.today() + timedelta(days=5), "value": 3.5,
+                 "as_of_date": date.today() + timedelta(days=6), "source": "MAS_API"}]
+    valid, rejected, _ = validate_macro_rows(records, "SORA")
+    assert len(valid) == 0
+    assert len(rejected) == 1
+    assert "future" in rejected[0]["reasons"][0]
+
+
 def test_validate_macro_rows_rejects_null_value():
     records = [{"series_id": "SORA", "obs_date": date(2024, 1, 2), "value": None,
                  "as_of_date": date(2024, 1, 3), "source": "MAS_API"}]
