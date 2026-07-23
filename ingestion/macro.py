@@ -107,8 +107,12 @@ def _describe_response_for_diagnostics(resp) -> str:
     """
     content_type = resp.headers.get("Content-Type", "<not set>")
     body_snippet = resp.text[:500] if resp.text else "<empty body>"
-    looks_like_html = resp.text.strip().lower().startswith(("<!doctype", "<html"))
-    looks_like_json = resp.text.strip().startswith(("{", "["))
+    # Strip a possible UTF-8 BOM before checking - MAS's own maintenance
+    # page body starts with one, which defeated a naive startswith check
+    # (discovered live during the MP-P3-029 investigation, 2026-07-19).
+    _stripped = resp.text.strip().lstrip("\ufeff").strip()
+    looks_like_html = _stripped.lower().startswith(("<!doctype", "<html"))
+    looks_like_json = _stripped.startswith(("{", "["))
 
     if not resp.text or not resp.text.strip():
         interpretation = (
@@ -117,6 +121,21 @@ def _describe_response_for_diagnostics(resp) -> str:
             "API handler (e.g. a WAF/security layer rejecting requests without a "
             "browser-like User-Agent header - see the User-Agent now sent by this "
             "client), rate limiting, or the resource_id no longer exists."
+        )
+    elif "maintenance.mas.gov.sg" in body_snippet or resp.headers.get("Server") == "AkamaiNetStorage":
+        interpretation = (
+            "CONFIRMED RETIREMENT SIGNATURE (see PROJECT_STATUS.md MP-P3-029 "
+            "investigation, 2026-07-19): this exact response - HTML referencing "
+            "maintenance.mas.gov.sg, served with Server: AkamaiNetStorage - was "
+            "reproduced for every resource_id tested, including the example given "
+            "in MAS's own official API documentation. This is not a transient "
+            "failure or a wrong resource_id; the legacy "
+            "/api/action/datastore/search.json CKAN-style endpoint has been "
+            "retired. MAS's own statistics page (mas.gov.sg/statistics) now "
+            "directs API consumers to the APIMG portal "
+            "(eservices.mas.gov.sg/apimg-portal/api-catalog) instead. Do not "
+            "retry this endpoint - see PROJECT_STATUS.md for the full "
+            "investigation and the specific action needed to migrate."
         )
     elif looks_like_html:
         interpretation = (

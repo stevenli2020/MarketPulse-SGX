@@ -5,6 +5,47 @@
 
 ---
 
+## MP-P3-029 — SORA official endpoint investigation (2026-07-19)
+
+**Trigger:** after the MP-P3-028 diagnostic/User-Agent fix, Sprite's full WSL verification run showed rollback, logging/exit-code, DuckDB integrity, FRED, Yahoo Finance FX, and idempotency (FRED & FX) all **PASS**. SORA live ingestion still **FAILED**, now with rich diagnostics: HTTP 200, `Content-Type: text/html`, response is an HTML maintenance page served by Akamai.
+
+### Investigation conducted (real, live, against the actual environment via the WSL MCP connector - not simulated)
+
+1. **Reproduced and diagnosed the failure directly.** Probed the legacy endpoint (`/api/action/datastore/search.json`) with: the currently configured `resource_id`, the previously-documented alternate `resource_id`, no custom headers, and - critically - **the exact example `resource_id` given in MAS's own official API documentation** (Exchange Rates, `10eafb90-11a2-4fbd-b7a7-ac15a42d60b6`). **All four returned the byte-identical HTML body**: `<!-- saved from url=(0039)http://maintenance.mas.gov.sg/eservice/ -->`, `Server: AkamaiNetStorage`, `Last-Modified: Tue, 08 Jul 2025` (over a year old at time of testing - not a transient blip).
+2. **Confirmed this is endpoint-specific, not a general outage:** the base `eservices.mas.gov.sg` domain returns a real, distinct, healthy homepage - only the legacy datastore API path is affected.
+3. **Since MAS's own documented example resource_id fails identically, the conclusion is unambiguous: the legacy CKAN-style datastore API has been retired entirely, for every resource_id, not just an SORA-specific configuration problem.**
+4. **Found MAS's own stated replacement:** `www.mas.gov.sg/statistics` (a live, current page) explicitly states: *"Access MAS APIs for exchange rates, interest rates, loans and more at **APIMG portal**"* - direct institutional confirmation, not inference.
+5. **Investigated the APIMG portal** (`eservices.mas.gov.sg/apimg-portal/api-catalog`): confirmed live (HTTP 200) but is a JavaScript-rendered SPA that cannot be browsed via plain HTTP requests. Fetched and analyzed its JS bundle directly (a standard, safe technique for this situation) and found:
+   - A real backend gateway URL pattern: `https://{env}.gateway.mas.gov.sg/api/{product_name}/`, built on **Axway** (per an embedded internal document reference), using `subscriptionKey`-based authentication.
+   - Formal, tiered API product categories ("MAS Data API (Non-sensitive)", "MAS Data/Transaction API (Sensitive Normal)") with subscription statuses ("Subscribed", "Unsubscribed", "Access Revoked") - confirming this is a **registration-gated, self-service developer portal**, not an open public API.
+   - The specific gateway hostname found (`gateway.mas.gov.sg`) is explicitly labeled **"(Intranet)"** in the portal's own configuration UI, and **does not resolve via public DNS at all** (confirmed via a DNS sanity check that succeeded for `google.com`, `data.gov.sg`, `eservices.mas.gov.sg`, and `www.mas.gov.sg` in the same test, ruling out a general DNS problem) - meaning this specific hostname is MAS-internal infrastructure, not the public consumer-facing endpoint.
+6. **Investigated data.gov.sg as an alternative official Singapore Government source** (Stage 2, priority 2). Confirmed it has a real, working, no-API-key-required dataset API (`api-production.data.gov.sg`, `data.gov.sg/api/action/datastore_search`). Found one MAS-sourced dataset - "Current Banks Interest Rates (End Of Period), **Monthly**" (`dataset_id=d_5fe5a4bb4a1ecc4d8a56a095832e2b24`) - but this is monthly, end-of-period bank rates, not daily SORA, and does not appear to be the right granularity or series for this project's needs. No daily-SORA-specific dataset was found on data.gov.sg via search.
+7. **Important side-finding on the legacy resource_id's original correctness:** MAS's "Domestic Interest Rates" statistics page explicitly states several rates *"discontinued... with effect from 1 January 2014"* (old interbank rates) - a different, older set of benchmarks than SORA (introduced later, ~2018+). This raises a real possibility that the originally configured `resource_id` (`9a0bf149-...`, "Domestic Interest Rates") may never have been the conceptually correct dataset for daily SORA specifically, independent of the endpoint retirement. Not fully resolved - noted as an open question for whoever picks this up next, whether that's a future automated attempt or a human confirming via the APIMG portal.
+
+### Engineering decision
+
+**This investigation could not be fully completed to either Option A (restore official live SORA) or a clean Option B (working alternative official source) within this session, and I am not going to claim otherwise.** The remaining blocker is a genuine human-in-the-loop requirement, not a lack of effort: the correct public-facing APIMG gateway URL, the correct product name for SORA, and a working `subscriptionKey` can only be obtained by a person registering on the APIMG developer portal with a real browser (the portal requires JavaScript execution to browse its API catalog, which is outside what either Cola's sandbox or the WSL MCP connector's `execute_python_script`/`requests`-based tooling can do - neither has a headless browser).
+
+**Code changes made now, ready for the moment credentials/endpoint are confirmed:**
+- `ingestion/macro.py`'s diagnostic interpretation now specifically recognizes this exact retirement signature (`maintenance.mas.gov.sg` in the body, or `Server: AkamaiNetStorage`) and reports it as a confirmed, documented retirement - not a generic "might be blocked" guess - pointing directly at this section for the full context and next action.
+- Fixed a small, genuinely-discovered robustness bug found live during this investigation: the maintenance page's body starts with a UTF-8 BOM character, which defeated the naive `looks_like_html` detection (harmless in practice, since the new retirement-signature check catches this exact case first regardless, but a real fix worth making).
+- Both changes verified: re-ran the live SORA fetch after patching and confirmed the new interpretation fires correctly; re-ran the full 22-test `tests/test_phase3_macro_ingestion.py` suite via real pytest in the WSL environment - **22 passed**, no regressions.
+
+**Action needed from Sprite to actually resolve this (the one thing I cannot do myself):**
+1. Log into `https://eservices.mas.gov.sg/apimg-portal/api-catalog` with a real browser.
+2. Search the catalog for a SORA or interest-rate related "MAS Data API (Non-sensitive)" product.
+3. Register/subscribe to obtain a `subscriptionKey`.
+4. Report back: the correct public base URL (not the intranet one found in this investigation), the correct product name/path, and the key (to be stored as an environment variable, e.g. `MAS_APIMG_SUBSCRIPTION_KEY`, mirroring the existing `FRED_API_KEY` pattern - never hardcoded or committed).
+5. If no suitable product exists on the APIMG portal at all, that itself is useful, conclusive information - it would mean pivoting fully to Option B and continuing the data.gov.sg (or another source) investigation with that confirmed.
+
+### Investigation evidence retained
+`verification/_mp_p3_029_sora_investigation.py`, `_mp_p3_029_apimg_js_inspect.py`, `_mp_p3_029_apimg_auth_inspect.py`, `_mp_p3_029_gateway_probe.py`, `_mp_p3_029_dns_sanity_check.py` - kept as reproducible evidence of this investigation, not deleted. Pure one-off patch/syntax-check scripts used only to apply the two code changes above were removed after use.
+
+### Regression check
+Full `tests/test_phase3_macro_ingestion.py` suite re-run via real pytest in Sprite's WSL environment (not simulated): **22 passed in 7.29s**, return code 0.
+
+---
+
 ## Phase 3 implementation record (2026-07-19)
 
 ### Files modified
