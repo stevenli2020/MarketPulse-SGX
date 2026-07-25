@@ -44,7 +44,15 @@ def _verify_one_series(series_id: str) -> dict:
         print(f"  FAIL: {e}")
         return {"series_id": series_id, "pass": False, "reason": str(e)}
 
-    valid_count = result["rows_inserted"] + result["rows_updated_revised"] + result["rows_unchanged"]
+    # Includes rows_deduplicated_within_batch (MP-P3-029c fix): the real
+    # MAS SORA data can legitimately contain records that collapse to
+    # the same (obs_date, as_of_date) pair within one fetch batch - see
+    # PROJECT_STATUS.md MP-P3-029b. Without this, a validated row that
+    # was correctly deduplicated would appear as "lost" here, which it
+    # is not - it's accounted for, just not individually classified as
+    # insert/update/unchanged.
+    valid_count = (result["rows_inserted"] + result["rows_updated_revised"] + result["rows_unchanged"]
+                   + result.get("rows_deduplicated_within_batch", 0))
     reconciles = valid_count == (result["rows_received"] - result["rows_rejected"])
     all_rejected = result["rows_received"] > 0 and result["rows_rejected"] == result["rows_received"]
 
@@ -60,8 +68,9 @@ def _verify_one_series(series_id: str) -> dict:
 
     print(f"  rows_received={result['rows_received']} rows_rejected={result['rows_rejected']} "
           f"rows_inserted={result['rows_inserted']} rows_updated_revised={result['rows_updated_revised']} "
-          f"rows_unchanged={result['rows_unchanged']} warnings={result['warnings']} "
-          f"revisions={result['revisions']}")
+          f"rows_unchanged={result['rows_unchanged']} "
+          f"rows_deduplicated_within_batch={result.get('rows_deduplicated_within_batch', 0)} "
+          f"warnings={result['warnings']} revisions={result['revisions']}")
     print(f"  coverage: {result['coverage_start']} to {result['coverage_end']}")
     for check_name, ok in checks.items():
         print(f"  [{'PASS' if ok else 'FAIL'}] {check_name}")

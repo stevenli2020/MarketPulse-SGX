@@ -104,9 +104,11 @@ def main():
         try:
             result = fetch_macro_series(series_id)
             results.append(result)
+            dedup = result.get("rows_deduplicated_within_batch", 0)
+            dedup_note = f", {dedup} deduplicated within batch" if dedup else ""
             print(f"  OK: {result['rows_received']} received, {result['rows_rejected']} rejected, "
                   f"{result['rows_inserted']} inserted, {result['rows_updated_revised']} revised, "
-                  f"{result['rows_unchanged']} unchanged, {result['warnings']} warnings, "
+                  f"{result['rows_unchanged']} unchanged{dedup_note}, {result['warnings']} warnings, "
                   f"coverage {result['coverage_start']} to {result['coverage_end']}")
         except IngestionFailure as e:
             macro_run_ok = False

@@ -619,6 +619,13 @@ def _ingest_one_series(series_id: str, normalize_fn) -> dict:
         [series_id],
     ).fetchone()
 
+    # Rows validated but not individually classified as insert/update/
+    # unchanged are exactly the ones collapsed by within-batch
+    # deduplication (MP-P3-029b) - reported explicitly so downstream
+    # reconciliation checks (e.g. verify_live_ingestion.py) can account
+    # for them rather than treating this as an unexplained data loss.
+    rows_deduplicated_within_batch = len(valid_rows) - (inserted + updated + unchanged)
+
     return {
         "series_id": series_id,
         "rows_received": len(records),
@@ -626,6 +633,7 @@ def _ingest_one_series(series_id: str, normalize_fn) -> dict:
         "rows_inserted": inserted,
         "rows_updated_revised": updated,
         "rows_unchanged": unchanged,
+        "rows_deduplicated_within_batch": rows_deduplicated_within_batch,
         "warnings": len(warnings),
         "revisions": len(revision_events),
         "coverage_start": coverage[0],
