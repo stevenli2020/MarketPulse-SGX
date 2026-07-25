@@ -5,6 +5,47 @@
 
 ---
 
+## MP-P3-029b — SORA RESOLVED: real MAS APIMG integration, live-verified (2026-07-19)
+
+**Outcome: Option A achieved. Official MAS SORA live ingestion is restored, using the real, current, production MAS APIMG gateway.**
+
+### What Sprite provided
+A real subscription key from `https://eservices.mas.gov.sg/apimg-portal` ("API for Domestic Interest Rates - Daily" product), plus the product page's code sample, which gave the exact missing pieces from the MP-P3-029 investigation: the real **public** base URL (`https://eservices.mas.gov.sg/apimg-gw/...` - confirmed "Production (Internet)", entirely distinct from the intranet-only `gateway.mas.gov.sg` found earlier), and the auth mechanism (a `keyid` HTTP header, not a generic `Ocp-Apim-Subscription-Key`).
+
+### Live investigation and integration (real, against the actual endpoint, with the real key)
+- Confirmed the endpoint works: real JSON data returned, backend is **Denodo** (`Content-Type: application/json;subtype=denodo-8.0`).
+- Confirmed exact field names directly against live data: `end_of_day` (obs_date) and `sora` (value) - both already matched what was configured; no more guessing required.
+- **Found something better than the existing as_of_date approximation**: each record carries a real `published_date` field (e.g. `end_of_day: 2026-07-22` -> `published_date: 2026-07-23`) - MAS's own authoritative publication timestamp, more accurate than the business-day approximation since it correctly reflects actual public holidays. Null on older historical rows, where the existing business-day fallback is used instead (mirrors the FRED vintage-vs-fallback pattern already established).
+- Confirmed Denodo's real filter syntax live: `$filter=end_of_day >= '...' and end_of_day <= '...'`.
+- Full dataset: 12,916 total rows (1987-07-04 to today), 6,266+ SORA-specific records from 2005-07-01 onward.
+
+### A genuine defect found via the first real live ingestion attempt
+The real MAS data contained records that normalize to the exact same `(obs_date, as_of_date)` pair within a single fetch batch, causing a real `PRIMARY KEY` constraint violation - `_upsert_macro_series` only ever protected against duplicates relative to rows already stored, never against duplicates arriving together in the same batch. **Fixed**: within-batch deduplication added (last-in-batch wins on exact duplicates; genuine value conflicts within a batch are flagged as a distinct `within_batch_conflict` event, not silently discarded). Verified: re-ran the real live ingestion after the fix - **6,267 rows received, 5,288 inserted cleanly, 0 rejected, 0 errors**.
+
+### A process mistake made and corrected during this work
+While updating the SORA-specific tests to match the new implementation, an overly broad text-block replacement incorrectly assumed all SORA-related tests were positioned contiguously in the test file. They weren't - they were interleaved by topic (normalization, date handling, fail-loud behavior) with the FRED/FX/idempotency/revision/rollback/multi-vintage tests. This briefly deleted those unrelated tests and, separately, a shared diagnostic helper function that happened to be physically adjacent to the old SORA section. **Both were fully recovered**: the test file was rebuilt from the last known-good git commit (`29dc33d`, pushed earlier in this session before this mistake occurred) with precise, individual replacements applied only to the specific SORA tests that needed updating - not a full-file guess. The diagnostic helper was re-added directly. Full test suite re-run and confirmed correct afterward. Documenting this plainly rather than omitting it - the recovery worked because the correct version had already been committed to git before the mistake, which is exactly the kind of safety margin frequent, real commits are meant to provide.
+
+### Verification results (real, live, in Sprite's WSL environment)
+- **Full test suite: 35 passed, 0 failed** (`tests/test_phase2_ingestion.py` + `tests/test_phase3_macro_ingestion.py`, now 27 Phase 3 tests: 22 original + 2 SORA tests updated for the new implementation + 5 new tests covering the subscription-key requirement, published_date logic, and the within-batch deduplication fix).
+- **DuckDB integrity verification: PASS** - all three series present (SORA: 5,289 rows, 2005-07-01 to 2026-07-23; US_FED_FUNDS_RATE: 6,539 rows; SGD_USD_FX: 5,885 rows), no duplicate PKs, no NULLs, no future dates, no `as_of_date < obs_date` violations.
+- **Rollback verification: PASS.**
+- **Logging/exit-code verification: PASS.**
+- **Live SORA ingestion, run twice back to back: correct idempotent behavior** - second run showed 5,288 unchanged, 0 updated, exactly 1 newly-available day inserted (today's just-published value) - proves both idempotency and that the pipeline picks up genuinely new data correctly.
+
+### One honest, important distinction
+The `verify_idempotency` module (run via `run_verification_module`, a fresh subprocess) currently still shows SORA failing with "MAS_APIMG_SUBSCRIPTION_KEY environment variable is not set" - **this is correct, expected fail-loud behavior, not a remaining bug.** My direct testing (which set the environment variable inline within that one test script) proved the SORA code itself works correctly end-to-end against live MAS data. But `MAS_APIMG_SUBSCRIPTION_KEY` has not yet been added to Sprite's actual persistent environment (`.env` or shell), so any freshly-invoked process - including the "official" verification tooling - correctly can't see it yet and correctly refuses to proceed rather than silently failing some other way.
+
+### Action needed from Sprite to get a fully clean official verification run
+```bash
+echo 'MAS_APIMG_SUBSCRIPTION_KEY=c6337dce-ef16-49d5-b9ad-6af41bedb894' >> .env
+```
+(or `export MAS_APIMG_SUBSCRIPTION_KEY=...` directly in the shell), then re-run `python -m verification.run_all_verifications` for the complete, official, all-green result.
+
+### Files modified this session (MP-P3-029b)
+`config.py` (real APIMG endpoint config, `MAS_APIMG_SUBSCRIPTION_KEY` env var), `ingestion/macro.py` (real SORA fetch/normalize implementation, within-batch deduplication fix, re-added diagnostic helper), `tests/test_phase3_macro_ingestion.py` (27 tests, SORA tests updated + 5 new). All changes committed and pushed to `main`.
+
+---
+
 ## MP-P3-029 — SORA official endpoint investigation (2026-07-19)
 
 **Trigger:** after the MP-P3-028 diagnostic/User-Agent fix, Sprite's full WSL verification run showed rollback, logging/exit-code, DuckDB integrity, FRED, Yahoo Finance FX, and idempotency (FRED & FX) all **PASS**. SORA live ingestion still **FAILED**, now with rich diagnostics: HTTP 200, `Content-Type: text/html`, response is an HTML maintenance page served by Akamai.

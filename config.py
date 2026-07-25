@@ -51,45 +51,54 @@ MACRO_HISTORY_START_DATE = "1990-01-01"  # same floor as PRICE_HISTORY_START_DAT
 # endpoint (see ingestion/macro.py) rather than requiring registration.
 FRED_API_KEY = os.environ.get("FRED_API_KEY")
 
+# Required for SORA ingestion (MP-P3-029b, 2026-07-19). Unlike FRED,
+# there is no no-key fallback for SORA - the legacy no-auth endpoint is
+# permanently retired (see PROJECT_STATUS.md). Obtained by Sprite via
+# self-service registration at https://eservices.mas.gov.sg/apimg-portal
+# ("API for Domestic Interest Rates - Daily" product). Read from the
+# environment only - never hardcoded or committed. If unset, SORA
+# ingestion fails loud with a clear, specific message telling the
+# operator to set this variable, rather than a confusing HTTP-level error.
+MAS_APIMG_SUBSCRIPTION_KEY = os.environ.get("MAS_APIMG_SUBSCRIPTION_KEY")
+
 # Per-series source configuration. Kept as one dict so a source decision
 # (URL, field names) lives in exactly one place, per this project's
 # existing configuration style (see SECURITIES/INDICES above).
 MACRO_SOURCE_CONFIG = {
     "SORA": {
-        "source": "MAS_API",
-        "base_url": "https://eservices.mas.gov.sg/api/action/datastore/search.json",
-        # Official MAS "Domestic Interest Rates" dataset. This resource_id
-        # was found via a documented third-party technical walkthrough of
-        # the official MAS datastore API (mas.gov.sg/Statistics/APIs/API-
-        # Documentation.aspx confirms the API pattern itself), not from
-        # MAS's own docs directly, and could not be independently verified
-        # against the live endpoint in this development environment (no
-        # network access - see PROJECT_STATUS.md). MUST be confirmed on
-        # first real run; ingestion/macro.py fails loudly with the actual
-        # returned field names if this assumption is wrong, rather than
-        # silently mismapping data - see _identify_sora_value_field().
-        #
-        # UPDATE (2026-07-19, after a live JSONDecodeError - empty/
-        # non-JSON response body): a second, independently-sourced
-        # technical walkthrough of this same MAS API uses a DIFFERENT
-        # resource_id: "5f2b18a8-0883-4769-a635-879c63d3caac". I have not
-        # verified which (if either) is currently correct for daily SORA
-        # specifically - I'm not swapping this value based on an
-        # unverified second source, since that would just be trading one
-        # unverified guess for another. What I did change: added a
-        # browser-like User-Agent header (see _SORA_REQUEST_HEADERS in
-        # ingestion/macro.py), since that second source explicitly needed
-        # one, and MAS's eServices platform silently rejecting requests
-        # without one is a well-documented pattern for exactly this
-        # empty-body symptom. If the enhanced diagnostics (also added)
-        # show this resource_id genuinely doesn't exist (e.g. an explicit
-        # "not found" in the response body), try the alternate ID above.
-        "resource_id": "9a0bf149-308c-4bd2-832d-76c8e6cb47ed",
+        "source": "MAS_APIMG",
+        # RESOLVED 2026-07-19 (MP-P3-029/029b investigation, see
+        # PROJECT_STATUS.md for the full story): the legacy CKAN
+        # datastore endpoint above was confirmed permanently retired
+        # (byte-identical maintenance page for every resource_id tested,
+        # including MAS's own documented example). The real, current,
+        # PUBLIC production endpoint is MAS's APIMG gateway, confirmed
+        # live and working via a real subscription key obtained by
+        # Sprite through https://eservices.mas.gov.sg/apimg-portal -
+        # "API for Domestic Interest Rates - Daily" product.
+        "base_url": (
+            "https://eservices.mas.gov.sg/apimg-gw/server/"
+            "monthly_statistical_bulletin_non610mssql/domestic_interest_rates_daily/"
+            "views/domestic_interest_rates_daily"
+        ),
+        # Auth: a "keyid" HTTP header (confirmed via MAS's own code
+        # sample on the product page - NOT the generic Ocp-Apim-
+        # Subscription-Key header a typical Azure APIM setup would use).
+        # The key itself is read from the environment at request time
+        # (MAS_APIMG_SUBSCRIPTION_KEY) - never hardcoded or committed,
+        # matching the existing FRED_API_KEY pattern exactly.
+        "auth_header_name": "keyid",
         "date_field": "end_of_day",
-        # Candidate field names for the raw (non-compounded) daily SORA
-        # rate - genuinely uncertain which one the live API uses, see
-        # comment above. Tried in order; first present column wins.
-        "value_field_candidates": ["sora", "sora_rate", "overnight_sora"],
+        "value_field": "sora",  # confirmed directly against live data - no longer a guess
+        # Real MAS-provided publication-date field, confirmed present on
+        # recent rows (null on older historical rows, where the fallback
+        # business-day convention in ingestion/macro.py is used instead -
+        # mirrors the existing FRED vintage-vs-fallback pattern).
+        "published_date_field": "published_date",
+        # Backend is Denodo (confirmed via the Content-Type response
+        # header: application/json;subtype=denodo-8.0). Filtering uses
+        # Denodo's OData-style $filter syntax, confirmed working live:
+        # $filter=end_of_day >= '2024-01-01' and end_of_day <= '2024-01-10'
     },
     "US_FED_FUNDS_RATE": {
         "source": "FRED",

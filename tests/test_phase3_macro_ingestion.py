@@ -42,18 +42,19 @@ def con():
 # Source adapter normalization
 # =============================================================================
 
-def test_sora_json_decode_error_produces_rich_diagnostics():
+def test_sora_json_decode_error_produces_rich_diagnostics(monkeypatch):
     """
-    Reproduces the exact live failure reported after MP-P3-027
-    (JSONDecodeError: Expecting value: line 1 column 1 (char 0), i.e. an
-    empty response body) and confirms the enhanced diagnostics include
-    HTTP status, final URL, Content-Type, a body snippet, and a plain-
-    English interpretation - not just a bare "request failed" message.
+    Confirms the enhanced diagnostics (added after a real live
+    JSONDecodeError during MP-P3-027/028) still fire correctly against
+    the current APIMG implementation: HTTP status, final URL, Content-
+    Type, a body snippet, and a plain-English interpretation - not just
+    a bare "request failed" message.
     """
+    monkeypatch.setattr(macro_mod, "MAS_APIMG_SUBSCRIPTION_KEY", "fake-key-for-test")
     import json as json_mod
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.url = "https://eservices.mas.gov.sg/api/action/datastore/search.json?resource_id=test"
+    mock_resp.url = "https://eservices.mas.gov.sg/apimg-gw/server/test"
     mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
     mock_resp.text = ""
     mock_resp.raise_for_status = MagicMock()
@@ -61,7 +62,7 @@ def test_sora_json_decode_error_produces_rich_diagnostics():
 
     with patch.object(macro_mod.requests, "get", return_value=mock_resp):
         with pytest.raises(macro_mod.IngestionFailure) as exc_info:
-            macro_mod._fetch_sora_raw("1990-01-01", "2026-07-19")
+            macro_mod._fetch_sora_raw("2024-01-01", "2024-01-05")
 
     msg = str(exc_info.value)
     assert "HTTP status: 200" in msg
@@ -70,13 +71,25 @@ def test_sora_json_decode_error_produces_rich_diagnostics():
     assert "Engineering interpretation:" in msg
 
 
-def test_sora_request_sends_browser_like_user_agent():
+def test_sora_fails_loud_when_subscription_key_missing(monkeypatch):
     """
-    Regression test: MAS's eServices platform is understood to reject or
-    silently short-circuit requests without a browser-like User-Agent
-    (see config.py's MACRO_SOURCE_CONFIG["SORA"] comment). Confirms this
-    client actually sends one, not just documents the intent to.
+    SORA has no no-key fallback (unlike FRED) - the legacy no-auth
+    endpoint is permanently retired (see PROJECT_STATUS.md MP-P3-029).
     """
+    monkeypatch.setattr(macro_mod, "MAS_APIMG_SUBSCRIPTION_KEY", None)
+    with pytest.raises(macro_mod.IngestionFailure) as exc_info:
+        macro_mod._fetch_sora_raw("2024-01-01", "2024-01-05")
+    assert "MAS_APIMG_SUBSCRIPTION_KEY" in str(exc_info.value)
+    assert "apimg-portal" in str(exc_info.value)
+
+
+def test_sora_request_sends_keyid_auth_header(monkeypatch):
+    """
+    Confirms the real, confirmed-correct auth mechanism (a 'keyid'
+    header, per MAS's own code sample from the APIMG portal - not a
+    generic Ocp-Apim-Subscription-Key) is actually sent.
+    """
+    monkeypatch.setattr(macro_mod, "MAS_APIMG_SUBSCRIPTION_KEY", "fake-key-for-test")
     captured = {}
 
     def capture_get(*args, **kwargs):
@@ -84,35 +97,67 @@ def test_sora_request_sends_browser_like_user_agent():
         m = MagicMock()
         m.status_code = 200
         m.raise_for_status = MagicMock()
-        m.json.return_value = {"result": {"records": [{"end_of_day": "2024-01-02", "sora": "3.5"}], "total": 1}}
+        m.json.return_value = {"elements": [{"end_of_day": "2024-01-02", "sora": "3.5", "published_date": "2024-01-03T00:00:00"}]}
         return m
 
     with patch.object(macro_mod.requests, "get", capture_get):
         macro_mod._fetch_sora_raw("2024-01-01", "2024-01-05")
 
-    assert "User-Agent" in captured.get("headers", {})
-    assert "Mozilla" in captured["headers"]["User-Agent"]
+    assert captured.get("headers", {}).get("keyid") == "fake-key-for-test"
+    assert "$filter" in captured.get("params", {})
 
 
 def test_sora_normalization_maps_fields_correctly():
     records = [
-        {"end_of_day": "2024-01-02", "sora": "3.5123"},
-        {"end_of_day": "2024-01-03", "sora": "3.5200"},
+        {"end_of_day": "2024-01-02", "sora": "3.5123", "published_date": "2024-01-03T00:00:00"},
+        {"end_of_day": "2024-01-03", "sora": "3.5200", "published_date": "2024-01-04T00:00:00"},
     ]
     normalized = macro_mod._normalize_sora(records)
     assert len(normalized) == 2
     assert normalized[0]["series_id"] == "SORA"
     assert normalized[0]["obs_date"] == date(2024, 1, 2)
     assert normalized[0]["value"] == pytest.approx(3.5123)
-    assert normalized[0]["source"] == "MAS_API"
+    assert normalized[0]["as_of_date"] == date(2024, 1, 3)  # real published_date, not a fallback
+    assert normalized[0]["source"] == "MAS_APIMG_published_date"
 
 
-def test_sora_normalization_fails_loud_on_unknown_value_field():
-    records = [{"end_of_day": "2024-01-02", "totally_unexpected_field": "3.5"}]
-    with pytest.raises(macro_mod.IngestionFailure) as exc_info:
-        macro_mod._normalize_sora(records)
-    assert "could not identify the SORA value field" in str(exc_info.value)
-    assert "totally_unexpected_field" in str(exc_info.value)
+def test_sora_normalization_falls_back_to_business_day_when_published_date_missing():
+    """Older MAS APIMG rows don't carry a published_date value (confirmed live)."""
+    records = [{"end_of_day": "2005-07-01", "sora": "0.5", "published_date": None}]
+    normalized = macro_mod._normalize_sora(records)
+    assert len(normalized) == 1
+    assert normalized[0]["source"] == "MAS_APIMG_business_day_fallback"
+    assert normalized[0]["as_of_date"] == macro_mod._plus_one_business_day(date(2005, 7, 1))
+
+
+def test_sora_normalization_skips_rows_with_null_value():
+    """Rows before SORA existed (pre-2005) or genuine gaps - not an error, just skipped."""
+    records = [
+        {"end_of_day": "1987-07-04", "sora": None, "published_date": None},
+        {"end_of_day": "2024-01-02", "sora": "3.5", "published_date": "2024-01-03T00:00:00"},
+    ]
+    normalized = macro_mod._normalize_sora(records)
+    assert len(normalized) == 1
+    assert normalized[0]["obs_date"] == date(2024, 1, 2)
+
+
+def test_sora_fails_loud_when_response_shape_unexpected_fields(monkeypatch):
+    """
+    Defensive shape check (MP-P3-029b): if MAS's API field names ever
+    change again, fail loud with the actual fields found, rather than
+    silently returning all-null values. Check now lives in
+    _fetch_sora_raw (the field names are confirmed, not guessed, so the
+    old candidate-list-based _identify_sora_value_field is retired).
+    """
+    monkeypatch.setattr(macro_mod, "MAS_APIMG_SUBSCRIPTION_KEY", "fake-key-for-test")
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {"elements": [{"totally_different_field": "x"}]}
+    with patch.object(macro_mod.requests, "get", return_value=mock_resp):
+        with pytest.raises(macro_mod.IngestionFailure) as exc_info:
+            macro_mod._fetch_sora_raw("2024-01-01", "2024-01-05")
+    assert "totally_different_field" in str(exc_info.value)
 
 
 def test_fred_csv_normalization_modern_column_shape():
@@ -316,21 +361,73 @@ def test_macro_transaction_rollback_leaves_no_partial_data(con, monkeypatch):
 # Fail-loud behavior
 # =============================================================================
 
-def test_sora_api_exception_raises_ingestion_failure():
+def test_sora_api_exception_raises_ingestion_failure(monkeypatch):
+    monkeypatch.setattr(macro_mod, "MAS_APIMG_SUBSCRIPTION_KEY", "fake-key-for-test")
     with patch.object(macro_mod.requests, "get", side_effect=ConnectionError("simulated network failure")):
         with pytest.raises(macro_mod.IngestionFailure) as exc_info:
-            macro_mod._fetch_sora_raw("1990-01-01", "2024-01-01")
+            macro_mod._fetch_sora_raw("2024-01-01", "2024-01-05")
     assert "simulated network failure" in str(exc_info.value)
 
 
-def test_sora_empty_response_is_not_treated_as_success():
+def test_sora_empty_response_is_not_treated_as_success(monkeypatch):
+    monkeypatch.setattr(macro_mod, "MAS_APIMG_SUBSCRIPTION_KEY", "fake-key-for-test")
     mock_resp = MagicMock()
+    mock_resp.status_code = 200
     mock_resp.raise_for_status = MagicMock()
-    mock_resp.json.return_value = {"result": {"records": [], "total": 0}}
+    mock_resp.json.return_value = {"elements": []}
     with patch.object(macro_mod.requests, "get", return_value=mock_resp):
         with pytest.raises(macro_mod.IngestionFailure) as exc_info:
-            macro_mod._fetch_sora_raw("1990-01-01", "2024-01-01")
+            macro_mod._fetch_sora_raw("2024-01-01", "2024-01-05")
     assert "zero records" in str(exc_info.value)
+
+
+def test_upsert_deduplicates_within_batch_conflicts(con):
+    """
+    Regression test for a real defect found via the first live SORA
+    ingestion (MP-P3-029b): the real MAS APIMG data contained more than
+    one record normalizing to the exact same (obs_date, as_of_date) pair
+    within a single batch, causing a real PRIMARY KEY constraint
+    violation. Confirms deduplication now handles this gracefully.
+    """
+    rows = [
+        {"series_id": "SORA", "obs_date": date(2005, 7, 1), "value": 0.5,
+         "as_of_date": date(2005, 7, 4), "source": "MAS_APIMG_business_day_fallback"},
+        {"series_id": "SORA", "obs_date": date(2005, 7, 1), "value": 0.5,
+         "as_of_date": date(2005, 7, 4), "source": "MAS_APIMG_business_day_fallback"},
+    ]
+    con.execute("BEGIN TRANSACTION")
+    inserted, updated, unchanged, revisions = macro_mod._upsert_macro_series(con, "SORA", rows)
+    con.execute("COMMIT")
+    assert inserted == 1
+    count = con.execute(
+        "SELECT COUNT(*) FROM raw_macro_series WHERE series_id='SORA' AND obs_date='2005-07-01'"
+    ).fetchone()[0]
+    assert count == 1
+
+
+def test_upsert_flags_within_batch_value_conflict():
+    """
+    If two records in the same batch share (obs_date, as_of_date) but
+    genuinely DIFFER in value, that's flagged as a distinct event_type,
+    not silently discarded or conflated with an ordinary revision.
+    """
+    import sqlite3
+    con = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+    sqlite3.register_adapter(date, lambda d: d.isoformat())
+    sqlite3.register_converter("DATE", lambda b: date.fromisoformat(b.decode()))
+    con.execute("""CREATE TABLE raw_macro_series (
+        series_id TEXT, obs_date DATE, value REAL, as_of_date DATE, source TEXT, ingested_at TIMESTAMP,
+        PRIMARY KEY (series_id, obs_date, as_of_date))""")
+    rows = [
+        {"series_id": "SORA", "obs_date": date(2005, 7, 1), "value": 0.5,
+         "as_of_date": date(2005, 7, 4), "source": "test"},
+        {"series_id": "SORA", "obs_date": date(2005, 7, 1), "value": 0.6,
+         "as_of_date": date(2005, 7, 4), "source": "test"},
+    ]
+    inserted, updated, unchanged, revisions = macro_mod._upsert_macro_series(con, "SORA", rows)
+    assert inserted == 1
+    assert len(revisions) == 1
+    assert revisions[0]["event_type"] == "within_batch_conflict"
 
 
 def test_fred_csv_unrecognized_shape_fails_loud():

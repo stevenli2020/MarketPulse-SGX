@@ -49,7 +49,7 @@ import requests
 import yfinance
 
 from config import (
-    FRED_API_KEY, MACRO_HISTORY_START_DATE, MACRO_SOURCE_CONFIG,
+    FRED_API_KEY, MAS_APIMG_SUBSCRIPTION_KEY, MACRO_HISTORY_START_DATE, MACRO_SOURCE_CONFIG,
 )
 from db.connection import get_connection
 from ingestion.prices import IngestionFailure, NormalizationFailure
@@ -72,44 +72,16 @@ def _plus_one_business_day(d: date) -> date:
     return (pd.Timestamp(d) + pd.tseries.offsets.BDay(1)).date()
 
 
-# =============================================================================
-# SORA (MAS official API)
-# =============================================================================
-
-def _identify_sora_value_field(sample_record: dict, series_id: str) -> str:
-    """
-    The exact field name for the raw daily SORA rate in MAS's API
-    response is not independently confirmed (see config.py comment on
-    MACRO_SOURCE_CONFIG["SORA"]). Tries each candidate in order; fails
-    loud with the actual returned field names if none match, rather than
-    silently reading the wrong column - the same defensive pattern used
-    for yfinance's MultiIndex column identification in Phase 2.
-    """
-    candidates = MACRO_SOURCE_CONFIG["SORA"]["value_field_candidates"]
-    for c in candidates:
-        if c in sample_record:
-            return c
-    raise IngestionFailure(
-        f"{series_id}: could not identify the SORA value field in the MAS API "
-        f"response. Tried {candidates}. Actual fields returned: {sorted(sample_record.keys())}. "
-        f"config.py's MACRO_SOURCE_CONFIG['SORA']['value_field_candidates'] needs updating."
-    )
-
-
 def _describe_response_for_diagnostics(resp) -> str:
     """
     Builds a human-readable diagnostic block from an HTTP response, for
     when a request "succeeds" at the transport level (no exception, no
-    4xx/5xx) but the body isn't the JSON we expected - exactly the
-    reported JSONDecodeError: "Expecting value: line 1 column 1 (char 0)",
-    which happens when .json() is called on an empty or non-JSON body.
-    A bare exception message doesn't say WHY; this does.
+    4xx/5xx) but the body isn't the JSON we expected. A bare exception
+    message doesn't say WHY; this does.
     """
     content_type = resp.headers.get("Content-Type", "<not set>")
     body_snippet = resp.text[:500] if resp.text else "<empty body>"
-    # Strip a possible UTF-8 BOM before checking - MAS's own maintenance
-    # page body starts with one, which defeated a naive startswith check
-    # (discovered live during the MP-P3-029 investigation, 2026-07-19).
+
     _stripped = resp.text.strip().lstrip("\ufeff").strip()
     looks_like_html = _stripped.lower().startswith(("<!doctype", "<html"))
     looks_like_json = _stripped.startswith(("{", "["))
@@ -119,29 +91,23 @@ def _describe_response_for_diagnostics(resp) -> str:
             "Response body is completely empty. Common causes for MAS's eServices "
             "API specifically: the request was blocked before reaching the actual "
             "API handler (e.g. a WAF/security layer rejecting requests without a "
-            "browser-like User-Agent header - see the User-Agent now sent by this "
-            "client), rate limiting, or the resource_id no longer exists."
+            "browser-like User-Agent header), rate limiting, or an invalid endpoint."
         )
     elif "maintenance.mas.gov.sg" in body_snippet or resp.headers.get("Server") == "AkamaiNetStorage":
         interpretation = (
             "CONFIRMED RETIREMENT SIGNATURE (see PROJECT_STATUS.md MP-P3-029 "
             "investigation, 2026-07-19): this exact response - HTML referencing "
             "maintenance.mas.gov.sg, served with Server: AkamaiNetStorage - was "
-            "reproduced for every resource_id tested, including the example given "
-            "in MAS's own official API documentation. This is not a transient "
-            "failure or a wrong resource_id; the legacy "
-            "/api/action/datastore/search.json CKAN-style endpoint has been "
-            "retired. MAS's own statistics page (mas.gov.sg/statistics) now "
-            "directs API consumers to the APIMG portal "
-            "(eservices.mas.gov.sg/apimg-portal/api-catalog) instead. Do not "
-            "retry this endpoint - see PROJECT_STATUS.md for the full "
-            "investigation and the specific action needed to migrate."
+            "reproduced for every resource_id tested against the legacy CKAN "
+            "datastore endpoint, including MAS's own documented example. That "
+            "endpoint is permanently retired - see PROJECT_STATUS.md for the "
+            "resolution (migrated to the APIMG gateway, MP-P3-029b)."
         )
     elif looks_like_html:
         interpretation = (
             "Response body is HTML, not JSON - almost certainly an error page, "
-            "login/block page, or a redirect target, not the datastore API response. "
-            "This points to a wrong URL/resource_id or a request being intercepted "
+            "login/block page, or a redirect target, not the expected API response. "
+            "This points to a wrong URL/endpoint or a request being intercepted "
             "before reaching the API, not a transient network issue."
         )
     elif looks_like_json:
@@ -166,120 +132,116 @@ def _describe_response_for_diagnostics(resp) -> str:
     )
 
 
-# Government/institutional endpoints (MAS's eServices platform included)
-# commonly reject or silently short-circuit requests that don't carry a
-# browser-like User-Agent, returning an empty or non-JSON body rather
-# than a clean error status - exactly the reported symptom. This is a
-# defensive, standard hardening step for calling such APIs, not a
-# fabricated fix - added after finding a working third-party example of
-# this exact API that explicitly sets one. Does not change the request
-# semantics (same URL, same params) otherwise.
-_SORA_REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-}
-
+# =============================================================================
+# SORA (MAS APIMG gateway - RESOLVED 2026-07-19, see PROJECT_STATUS.md
+# MP-P3-029/029b for the full investigation. The previous implementation
+# targeted a legacy CKAN-style endpoint that was confirmed permanently
+# retired; this targets the real, working, public production gateway.)
+# =============================================================================
 
 def _fetch_sora_raw(start_date: str, end_date: str) -> list:
     """
-    Fetches raw SORA records from the official MAS datastore API,
-    paginating via offset (the API caps at 100 rows per call).
-    Raises IngestionFailure on any unusable response or request
-    exception - never returns partial results silently, never retries
-    indefinitely (each call is attempted exactly once), never
-    substitutes fallback data.
-
-    DIAGNOSTIC ENHANCEMENT (2026-07-19, after a live JSONDecodeError):
-    a bare ".json() failed" message doesn't say why. On any failure to
-    parse the response as JSON, the full diagnostic block from
-    _describe_response_for_diagnostics() is included in the
-    IngestionFailure message - status code, headers, Content-Type, a
-    body snippet, the final URL, JSON-vs-HTML detection, and a plain-
-    English interpretation - so the actual cause is visible from the
-    error message itself, not just "it failed".
+    Fetches raw SORA records from MAS's real APIMG gateway (Denodo-backed
+    data virtualization layer). Raises IngestionFailure if
+    MAS_APIMG_SUBSCRIPTION_KEY is unset, on any unusable response, or on
+    a request exception. Never retries silently, never substitutes
+    fallback data.
     """
+    if not MAS_APIMG_SUBSCRIPTION_KEY:
+        raise IngestionFailure(
+            "SORA: MAS_APIMG_SUBSCRIPTION_KEY environment variable is not set. "
+            "Obtain a subscription key via https://eservices.mas.gov.sg/apimg-portal "
+            "('API for Domestic Interest Rates - Daily' product) and set it as an "
+            "environment variable before running SORA ingestion."
+        )
+
     cfg = MACRO_SOURCE_CONFIG["SORA"]
-    all_records = []
-    offset = 0
-    limit = 100
+    filter_expr = f"{cfg['date_field']} >= '{start_date}' and {cfg['date_field']} <= '{end_date}'"
+    headers = {cfg["auth_header_name"]: MAS_APIMG_SUBSCRIPTION_KEY}
 
-    while True:
-        params = {
-            "resource_id": cfg["resource_id"],
-            "between[{}]".format(cfg["date_field"]): f"{start_date},{end_date}",
-            "limit": limit,
-            "offset": offset,
-            "sort": f"{cfg['date_field']} asc",
-        }
-        try:
-            resp = requests.get(cfg["base_url"], params=params, headers=_SORA_REQUEST_HEADERS, timeout=30)
-        except IngestionFailure:
-            raise
-        except Exception as e:
-            # A genuine transport-level exception (DNS failure, connection
-            # refused, timeout) - not a "successful" response with a bad
-            # body, which is handled separately below with richer context.
-            raise IngestionFailure(f"SORA: MAS API request failed (transport-level exception): {e!r}") from e
+    try:
+        resp = requests.get(cfg["base_url"], params={"$filter": filter_expr}, headers=headers, timeout=30)
+    except Exception as e:
+        raise IngestionFailure(f"SORA: MAS APIMG gateway request failed (transport-level exception): {e!r}") from e
 
-        try:
-            resp.raise_for_status()
-        except Exception as e:
-            raise IngestionFailure(
-                f"SORA: MAS API returned an HTTP error status.\n{_describe_response_for_diagnostics(resp)}\n"
-                f"Underlying exception: {e!r}"
-            ) from e
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        raise IngestionFailure(
+            f"SORA: MAS APIMG gateway returned an HTTP error status.\n{_describe_response_for_diagnostics(resp)}\n"
+            f"Underlying exception: {e!r}"
+        ) from e
 
-        try:
-            payload = resp.json()
-        except Exception as e:
-            raise IngestionFailure(
-                f"SORA: MAS API response could not be parsed as JSON.\n{_describe_response_for_diagnostics(resp)}\n"
-                f"Underlying exception: {e!r}"
-            ) from e
+    try:
+        payload = resp.json()
+    except Exception as e:
+        raise IngestionFailure(
+            f"SORA: MAS APIMG gateway response could not be parsed as JSON.\n{_describe_response_for_diagnostics(resp)}\n"
+            f"Underlying exception: {e!r}"
+        ) from e
 
-        result = payload.get("result")
-        if result is None or "records" not in result:
-            raise IngestionFailure(
-                f"SORA: unexpected MAS API response shape - missing result.records. "
-                f"Top-level keys: {sorted(payload.keys())}."
-            )
+    elements = payload.get("elements")
+    if elements is None:
+        raise IngestionFailure(
+            f"SORA: unexpected MAS APIMG response shape - missing 'elements'. "
+            f"Top-level keys: {sorted(payload.keys())}."
+        )
 
-        records = result["records"]
-        all_records.extend(records)
+    if not elements:
+        raise IngestionFailure(f"SORA: MAS APIMG gateway returned zero records for {start_date} to {end_date}")
 
-        total = result.get("total", len(all_records))
-        offset += limit
-        if offset >= int(total) or not records:
-            break
+    # Defensive shape check: if the API's field names ever change again,
+    # fail loud with the actual keys found rather than silently returning
+    # all-null values (see PROJECT_STATUS.md - this project's established
+    # pattern for exactly this risk).
+    cfg_check = MACRO_SOURCE_CONFIG["SORA"]
+    sample_keys = set(elements[0].keys())
+    if cfg_check["date_field"] not in sample_keys or cfg_check["value_field"] not in sample_keys:
+        raise IngestionFailure(
+            f"SORA: expected fields {cfg_check['date_field']!r}/{cfg_check['value_field']!r} not present in "
+            f"response records. Actual fields: {sorted(sample_keys)}. The MAS APIMG API shape may have changed."
+        )
 
-    if not all_records:
-        raise IngestionFailure("SORA: MAS API returned zero records for the requested range")
-
-    return all_records
+    return elements
 
 
 def _normalize_sora(records: list) -> list:
     cfg = MACRO_SOURCE_CONFIG["SORA"]
-    value_field = _identify_sora_value_field(records[0], "SORA")
+    date_field = cfg["date_field"]
+    value_field = cfg["value_field"]
+    published_field = cfg["published_date_field"]
 
     normalized = []
     for rec in records:
-        raw_date = rec.get(cfg["date_field"])
+        raw_date = rec.get(date_field)
         raw_value = rec.get(value_field)
-        if raw_date is None or raw_value in (None, "", "NA", "-"):
-            continue  # skipped here, not silently coerced; validate_macro_rows
-                      # would reject it anyway - filtering here avoids a
-                      # parse error on non-numeric placeholder values.
+        if raw_date is None or raw_value is None:
+            # Expected for rows before SORA existed (pre-2005) or genuine
+            # data gaps - not an error, just not a usable SORA observation.
+            continue
         obs_date = pd.to_datetime(raw_date).date()
         try:
             value = float(raw_value)
         except (TypeError, ValueError):
             continue
-        as_of_date = _plus_one_business_day(obs_date)
+
+        raw_published = rec.get(published_field)
+        if raw_published:
+            # Real MAS-provided publication date - more accurate than the
+            # business-day approximation, since it correctly reflects
+            # actual public holidays.
+            as_of_date = pd.to_datetime(raw_published).date()
+            source_tag = "MAS_APIMG_published_date"
+        else:
+            # Older historical rows don't carry a published_date value -
+            # documented fallback, same weekday-only-approximation
+            # convention as before (see _plus_one_business_day).
+            as_of_date = _plus_one_business_day(obs_date)
+            source_tag = "MAS_APIMG_business_day_fallback"
+
         normalized.append({
             "series_id": "SORA", "obs_date": obs_date, "value": value,
-            "as_of_date": as_of_date, "source": "MAS_API",
+            "as_of_date": as_of_date, "source": source_tag,
         })
     return normalized
 
@@ -526,6 +488,26 @@ def _upsert_macro_series(con, series_id: str, valid_rows: list):
 
     Returns (inserted, updated, unchanged, revision_events).
     """
+    # DEFECT FIX (MP-P3-029b, 2026-07-19, found via the first real live
+    # SORA ingestion): the real MAS APIMG data can contain more than one
+    # record that normalizes to the exact same (obs_date, as_of_date)
+    # pair within a single batch (observed: duplicate/near-duplicate
+    # entries for the same end_of_day). This previously caused a real
+    # PRIMARY KEY constraint violation, since only duplicates against
+    # rows already stored before this batch started were handled - not
+    # duplicates within the incoming batch itself. Deduplicated here,
+    # deterministically (last-in-batch wins), with a warning if the
+    # values genuinely differ (not just an exact repeat) so a real data
+    # inconsistency from the source isn't silently discarded.
+    deduped_rows = {}
+    within_batch_conflicts = []
+    for r in valid_rows:
+        key = (r["obs_date"], r["as_of_date"])
+        if key in deduped_rows and deduped_rows[key]["value"] != r["value"]:
+            within_batch_conflicts.append((key, deduped_rows[key]["value"], r["value"]))
+        deduped_rows[key] = r
+    valid_rows = list(deduped_rows.values())
+
     obs_dates = [r["obs_date"] for r in valid_rows]
     existing = _fetch_existing_macro(con, series_id, obs_dates)
     existing_by_vintage = existing["by_vintage"] if existing else {}
@@ -533,6 +515,12 @@ def _upsert_macro_series(con, series_id: str, valid_rows: list):
 
     inserted, updated, unchanged = 0, 0, 0
     revision_events = []
+
+    for key, old_val, new_val in within_batch_conflicts:
+        revision_events.append({
+            "obs_date": key[0], "event_type": "within_batch_conflict",
+            "old_value": old_val, "new_value": new_val,
+        })
 
     for r in valid_rows:
         od = r["obs_date"]
@@ -612,7 +600,10 @@ def _ingest_one_series(series_id: str, normalize_fn) -> dict:
 
         for rev in revision_events:
             detail = f"{series_id} {rev['obs_date']}: {rev['old_value']} -> {rev['new_value']}"
-            warning_type = "macro_revision_detected" if rev["event_type"] == "value_revision" else "macro_new_vintage_for_existing_obs_date"
+            warning_type = {
+                "value_revision": "macro_revision_detected",
+                "within_batch_conflict": "macro_within_batch_conflict",
+            }.get(rev["event_type"], "macro_new_vintage_for_existing_obs_date")
             _write_macro_warning(con, warning_type, series_id, rev["obs_date"], detail)
 
         con.execute("COMMIT")
